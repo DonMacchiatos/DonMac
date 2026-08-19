@@ -1,0 +1,4 @@
+{
+  "version": "6.0",
+  "notes": "✓ Waiting queue for cafes, restaurants and bakeries\n✓ Queue number printed large on the receipt\n✓ Wall screen at /queue/ calls each number out loud\n✓ Numbers allocated by the server, reset daily\n✓ In-app dialogs replace the browser alert boxes\n✓ Dashboard branded from the deployer form\n✓ Theme colour kept in a readable contrast range\n✓ One business id shared by the POS, dashboard and queue screen\n✓ Zero setup — business info, logo, theme and goal pre-applied"
+}
