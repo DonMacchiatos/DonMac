@@ -823,6 +823,89 @@ textarea:focus-visible,
 }
 
 </style>
+<style>
+/* ---- PREPARATION — ingredients and recipes --------------------------- */
+/* Reuses .inv-row, .stat, .badge and .hpill so this screen reads as part of
+   the same app; only what genuinely has no equivalent is defined here. */
+
+.prep-list { flex: 1; overflow-y: auto; padding-bottom: 96px; }
+
+.prep-empty {
+  text-align: center;
+  color: var(--t3);
+  font-size: 14px;
+  line-height: 1.8;
+  padding: 44px 26px;
+}
+.prep-empty strong { display: block; color: var(--t2); font-size: 15px; margin-bottom: 6px; }
+
+/* Recipe grouping: a product heading, then the ingredients it consumes. */
+.prep-grp {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 16px 16px 9px;
+  background: var(--bg1);
+  border-bottom: 1px solid var(--b1);
+}
+.prep-grp-n { flex: 1; font-size: 15px; font-weight: 700; min-width: 0; }
+
+.prep-yield {
+  font-size: 11px;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 20px;
+  white-space: nowrap;
+  background: var(--bg3);
+  color: var(--t2);
+}
+.prep-yield.ok  { background: var(--sg); color: var(--st); }
+.prep-yield.low { background: var(--wg); color: var(--wt); }
+.prep-yield.out { background: var(--dg); color: var(--dt); }
+
+.prep-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px 12px 28px;
+  border-bottom: 1px solid var(--b1);
+}
+.prep-line-n { flex: 1; font-size: 14px; font-weight: 600; min-width: 0; }
+.prep-line-s { font-size: 11px; color: var(--t3); margin-top: 2px; }
+.prep-line-q {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ac);
+  flex-shrink: 0;
+  font-variant-numeric: tabular-nums;
+}
+.prep-line-miss { color: var(--dt); }
+
+/* Stock figure on an ingredient row — tabular so the column stays aligned. */
+.ing-stock {
+  font-size: 15px;
+  font-weight: 700;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  min-width: 62px;
+}
+
+/* Quick +/- amounts inside the stock-adjust sheet. */
+.adj-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+.adj-btn {
+  padding: 14px 6px;
+  border-radius: 12px;
+  border: 1.5px solid var(--b2);
+  background: var(--bg2);
+  color: var(--t1);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  min-height: 44px;
+}
+.adj-btn:active { background: var(--bg3); transform: scale(.97); }
+.adj-btn.minus { color: var(--wt); }
+</style>
 </head>
 <body>
 <div id="app"><div class="toasts" id="toasts"></div></div>
@@ -1112,32 +1195,212 @@ async function recordCustomerSale(tx){
   }catch(e){}
 }
 
-async function deductIngredients(cartItems){
-  if(!CLOUD.token||!CLOUD.bizId)return;
-  try{
-    const h2={...H,'Authorization':'Bearer '+CLOUD.token};
-    // Get all recipes for products in this sale
-    const names=cartItems.map(i=>i.name);
-    const recipesRes=await fetch(SUPA_URL+'/rest/v1/recipes?biz_id=eq.'+CLOUD.bizId+'&product_name=in.('+names.map(n=>'"'+n+'"').join(',')+')',{headers:h2});
-    const recipes=await recipesRes.json();
-    if(!Array.isArray(recipes)||!recipes.length)return;
-    // Group deductions by ingredient
-    const deduct={};
-    cartItems.forEach(ci=>{
-      recipes.filter(r=>r.product_name===ci.name).forEach(r=>{
-        deduct[r.ingredient_id]=(deduct[r.ingredient_id]||0)+(r.qty_used*ci.qty);
-      });
+/* ==================================================================== *
+ * PREPARATION — raw ingredients and the recipes that consume them.
+ *
+ * Ingredients are held locally so the till keeps deducting stock when the
+ * connection drops; the cloud copy is a mirror, pushed on a best effort.
+ * This used to read recipes straight from Supabase on every sale, which
+ * meant an offline till silently stopped tracking ingredient usage.
+ * ==================================================================== */
+
+function ingById(id){
+  for(var i=0;i<S.ings.length;i++)if(S.ings[i].id===id)return S.ings[i];
+  return null;
+}
+function ingLevel(i){
+  var st=+i.stock||0, lo=(i.low===undefined||i.low===null)?0:+i.low;
+  if(st<=0)return 'out';
+  if(lo>0&&st<=lo)return 'low';
+  return 'ok';
+}
+function lowIngs(){return S.ings.filter(function(i){return ingLevel(i)==='low';});}
+function outIngs(){return S.ings.filter(function(i){return ingLevel(i)==='out';});}
+function recipesFor(name){return S.recipes.filter(function(r){return r.prod===name;});}
+
+// Rounds away binary-float drift so 0.1 + 0.2 never shows as 0.30000000000000004.
+function ingRound(n){return Math.round((+n||0)*1000)/1000;}
+function ingQtyStr(n,unit){
+  var v=ingRound(n);
+  return (Number.isInteger(v)?v:v.toFixed(2).replace(/0$/,''))+(unit?' '+unit:'');
+}
+
+// How many of a product the current ingredient stock can still produce.
+// null = this product has no recipe, so its own stock count governs it.
+function buildable(prodName){
+  var rs=recipesFor(prodName);
+  if(!rs.length)return null;
+  var min=Infinity, counted=false;
+  for(var k=0;k<rs.length;k++){
+    var per=+rs[k].qty||0;
+    if(per<=0)continue;              // a zero-quantity line consumes nothing
+    var ing=ingById(rs[k].ingId);
+    if(!ing)return 0;                // ingredient deleted — cannot be made
+    counted=true;
+    min=Math.min(min,Math.floor((+ing.stock||0)/per));
+  }
+  return counted?Math.max(0,min):null;
+}
+
+/* Applies a sale (dir = -1) or a void (dir = +1) to ingredient stock.
+   Returns the ingredients it touched so the caller can mirror them up. */
+function consumeIngredients(items,dir){
+  if(!Array.isArray(items)||!S.ings.length||!S.recipes.length)return [];
+  var touched={};
+  items.forEach(function(it){
+    var sold=+it.qty||0;
+    if(sold<=0)return;
+    recipesFor(it.name).forEach(function(r){
+      var per=+r.qty||0;
+      if(per<=0)return;
+      var ing=ingById(r.ingId);
+      if(!ing)return;
+      ing.stock=Math.max(0,ingRound((+ing.stock||0)+dir*per*sold));
+      touched[ing.id]=ing;
     });
-    // Apply deductions
-    for(const[ingId,qty] of Object.entries(deduct)){
-      const ingRes=await fetch(SUPA_URL+'/rest/v1/ingredients?id=eq.'+ingId,{headers:h2});
-      const ing=await ingRes.json();
-      if(ing&&ing[0]){
-        const newStock=Math.max(0,ing[0].stock-qty);
-        await fetch(SUPA_URL+'/rest/v1/ingredients?id=eq.'+ingId,{method:'PATCH',headers:{...h2,'Prefer':'return=representation'},body:JSON.stringify({stock:newStock})});
-      }
+  });
+  var list=Object.keys(touched).map(function(k){return touched[k];});
+  if(list.length){save();pushIngStock(list);}
+  return list;
+}
+
+async function pushIngStock(list){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  try{
+    var ch=cloudHeaders();
+    for(var i=0;i<list.length;i++){
+      if(list[i].cloudId===null||list[i].cloudId===undefined)continue;
+      await fetch(SUPA_URL+'/rest/v1/ingredients?id=eq.'+encodeURIComponent(list[i].cloudId),
+        {method:'PATCH',headers:ch,body:JSON.stringify({stock:list[i].stock})});
     }
   }catch(e){}
+}
+
+/* The Supabase ingredient table is also written by the Dashboard, so its
+   exact columns are not guaranteed here. Write the full row first; if the
+   server rejects it, fall back to the three columns the sale path relies
+   on rather than losing the record entirely. */
+async function saveIngToCloud(ing){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  var full={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock,unit:ing.unit||'',
+            cost:+ing.cost||0,low_threshold:+ing.low||0};
+  var lean={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock};
+  try{
+    var ch=cloudHeaders();
+    if(ing.cloudId!==null&&ing.cloudId!==undefined){
+      var u='/rest/v1/ingredients?id=eq.'+encodeURIComponent(ing.cloudId);
+      var r=await fetch(SUPA_URL+u,{method:'PATCH',headers:ch,body:JSON.stringify(full)});
+      if(!r.ok)await fetch(SUPA_URL+u,{method:'PATCH',headers:ch,body:JSON.stringify(lean)});
+      return;
+    }
+    var c=await fetch(SUPA_URL+'/rest/v1/ingredients',{method:'POST',headers:ch,body:JSON.stringify(full)});
+    if(!c.ok)c=await fetch(SUPA_URL+'/rest/v1/ingredients',{method:'POST',headers:ch,body:JSON.stringify(lean)});
+    if(!c.ok)return;
+    var rows=await c.json();
+    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){ing.cloudId=rows[0].id;save();}
+  }catch(e){}
+}
+
+async function delIngFromCloud(ing){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  if(ing.cloudId===null||ing.cloudId===undefined)return;
+  try{
+    var ch=cloudHeaders(), cid=encodeURIComponent(ing.cloudId);
+    // Recipe lines first, or they would point at an ingredient that is gone.
+    await fetch(SUPA_URL+'/rest/v1/recipes?biz_id=eq.'+CLOUD.bizId+'&ingredient_id=eq.'+cid,{method:'DELETE',headers:ch});
+    await fetch(SUPA_URL+'/rest/v1/ingredients?id=eq.'+cid,{method:'DELETE',headers:ch});
+  }catch(e){}
+}
+
+async function saveRecipeToCloud(r){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  var ing=ingById(r.ingId);
+  if(!ing||ing.cloudId===null||ing.cloudId===undefined)return; // stays local until its ingredient syncs
+  var row={biz_id:CLOUD.bizId,product_name:r.prod,ingredient_id:ing.cloudId,qty_used:+r.qty||0};
+  try{
+    var ch=cloudHeaders();
+    if(r.cloudId!==null&&r.cloudId!==undefined){
+      await fetch(SUPA_URL+'/rest/v1/recipes?id=eq.'+encodeURIComponent(r.cloudId),{method:'PATCH',headers:ch,body:JSON.stringify(row)});
+      return;
+    }
+    var c=await fetch(SUPA_URL+'/rest/v1/recipes',{method:'POST',headers:ch,body:JSON.stringify(row)});
+    if(!c.ok)return;
+    var rows=await c.json();
+    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){r.cloudId=rows[0].id;save();}
+  }catch(e){}
+}
+
+async function delRecipeFromCloud(r){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  if(r.cloudId===null||r.cloudId===undefined)return;
+  try{
+    await fetch(SUPA_URL+'/rest/v1/recipes?id=eq.'+encodeURIComponent(r.cloudId),{method:'DELETE',headers:cloudHeaders()});
+  }catch(e){}
+}
+
+/* Pulls whatever the Dashboard has, matching cloud rows to local ones by
+   stored cloud id first and by name second, so an ingredient typed on this
+   till and the same ingredient created on the Dashboard converge instead
+   of appearing twice. */
+async function loadIngredientsFromCloud(){
+  if(!CLOUD.token||!CLOUD.bizId)return;
+  var ch=cloudHeaders(), ingRows=null, recRows=null;
+  try{
+    var r1=await fetch(SUPA_URL+'/rest/v1/ingredients?biz_id=eq.'+CLOUD.bizId,{headers:ch});
+    if(r1.ok)ingRows=await r1.json();
+  }catch(e){}
+  try{
+    var r2=await fetch(SUPA_URL+'/rest/v1/recipes?biz_id=eq.'+CLOUD.bizId,{headers:ch});
+    if(r2.ok)recRows=await r2.json();
+  }catch(e){}
+  if(!Array.isArray(ingRows))return;
+
+  ingRows.forEach(function(row){
+    if(row.id===undefined||row.id===null)return;
+    var local=null;
+    for(var i=0;i<S.ings.length;i++){
+      var x=S.ings[i];
+      if(x.cloudId!==null&&x.cloudId!==undefined&&String(x.cloudId)===String(row.id)){local=x;break;}
+    }
+    if(!local){
+      for(var j=0;j<S.ings.length;j++){
+        var y=S.ings[j];
+        if((y.cloudId===null||y.cloudId===undefined)&&String(y.name||'').trim().toLowerCase()===String(row.name||'').trim().toLowerCase()){local=y;break;}
+      }
+    }
+    if(!local){
+      local={id:S.ingNid++,cloudId:row.id,name:row.name||'Ingredient',unit:'',stock:0,low:0,cost:0};
+      S.ings.push(local);
+    }
+    local.cloudId=row.id;
+    if(row.name)local.name=row.name;
+    if(row.stock!==undefined&&row.stock!==null)local.stock=ingRound(row.stock);
+    if(row.unit!==undefined&&row.unit!==null)local.unit=row.unit;
+    if(row.cost!==undefined&&row.cost!==null)local.cost=+row.cost||0;
+    if(row.low_threshold!==undefined&&row.low_threshold!==null)local.low=+row.low_threshold||0;
+  });
+
+  if(Array.isArray(recRows))recRows.forEach(function(row){
+    if(row.id===undefined||row.id===null)return;
+    var ing=null;
+    for(var i=0;i<S.ings.length;i++){
+      var x=S.ings[i];
+      if(x.cloudId!==null&&x.cloudId!==undefined&&String(x.cloudId)===String(row.ingredient_id)){ing=x;break;}
+    }
+    if(!ing)return;
+    var ex=null;
+    for(var j=0;j<S.recipes.length;j++){
+      var r=S.recipes[j];
+      if((r.cloudId!==null&&r.cloudId!==undefined&&String(r.cloudId)===String(row.id))||
+         (r.prod===row.product_name&&r.ingId===ing.id)){ex=r;break;}
+    }
+    if(!ex){ex={id:S.recipeNid++,cloudId:row.id,prod:row.product_name,ingId:ing.id,qty:0};S.recipes.push(ex);}
+    ex.cloudId=row.id;
+    ex.prod=row.product_name;
+    ex.ingId=ing.id;
+    ex.qty=+row.qty_used||0;
+  });
+  save();
 }
 async function loadCloudData(silent){
   if(!CLOUD.token||!CLOUD.bizId)return;
@@ -1167,6 +1430,7 @@ async function loadCloudData(silent){
   await loadSettingsFromCloud();
   await loadCloudCustomers();
   await loadAttEmployees();
+  await loadIngredientsFromCloud();
 }
 async function saveProductsToCloud(){
   if(!CLOUD.token||!CLOUD.bizId)return false;
@@ -1321,6 +1585,12 @@ let S={
   expenses:[],expenseNid:1,expFilter:'today',
   cashiers:[],cashierNid:1,activeCashier:null,shiftStart:null,
   alertDismissed:false,
+  // Preparation: raw ingredients and the recipes that link them to products.
+  ings:[],ingNid:1,recipes:[],recipeNid:1,
+  prepTab:'ing',prepSearch:'',ingFilter:'all',
+  // Inventory and Preparation both edit stock, so one admin unlock covers
+  // both. Deliberately not persisted — it re-locks on every app launch.
+  stockLocked:true,
   cloudEmail:'',cloudBizName:'',
   authScreen:'login',
   selectedCustomer:null,
@@ -1427,6 +1697,14 @@ function load(){
     if(d.cashierNid)S.cashierNid=d.cashierNid;
     if(d.activeCashier)S.activeCashier=d.activeCashier;
     if(d.shiftStart)S.shiftStart=d.shiftStart;
+    if(Array.isArray(d.ings))S.ings=d.ings;
+    if(d.ingNid)S.ingNid=d.ingNid;
+    if(Array.isArray(d.recipes))S.recipes=d.recipes;
+    if(d.recipeNid)S.recipeNid=d.recipeNid;
+    // Guard the id counters: a hand-edited or partially-restored payload can
+    // leave them behind the highest id, which would hand out duplicates.
+    S.ings.forEach(function(i){if((parseInt(i.id)||0)>=S.ingNid)S.ingNid=(parseInt(i.id)||0)+1;});
+    S.recipes.forEach(function(r){if((parseInt(r.id)||0)>=S.recipeNid)S.recipeNid=(parseInt(r.id)||0)+1;});
     // Restore cloud session
     const ct=localStorage.getItem('arroyo_cloud');
     if(ct){try{const c=JSON.parse(ct);CLOUD.user=c.user;CLOUD.token=c.token;CLOUD.refresh=c.refresh||null;CLOUD.bizId=c.bizId;S.cloudEmail=c.email||'';S.cloudBizName=c.bizName||'';}catch(e){}}
@@ -1445,7 +1723,8 @@ function save(){
       bizLogo:S.bizLogo,dailyGoal:S.dailyGoal,
       expenses:S.expenses,expenseNid:S.expenseNid,
       cashiers:S.cashiers,cashierNid:S.cashierNid,
-      activeCashier:S.activeCashier,shiftStart:S.shiftStart
+      activeCashier:S.activeCashier,shiftStart:S.shiftStart,
+      ings:S.ings,ingNid:S.ingNid,recipes:S.recipes,recipeNid:S.recipeNid
     }));
     if(CLOUD.token)localStorage.setItem('arroyo_cloud',JSON.stringify({user:CLOUD.user,token:CLOUD.token,refresh:CLOUD.refresh,bizId:CLOUD.bizId,email:S.cloudEmail,bizName:S.cloudBizName}));
   }catch(e){}
@@ -1932,11 +2211,12 @@ function render(){
     if(S.cartOpen)renderCart(scr);
     else renderPOS(scr);
   }
-  else if(S.screen==='inv')renderInv(scr);
+  else if(S.screen==='inv'){S.stockLocked?renderStockLock(scr,'inv'):renderInv(scr);}
+  else if(S.screen==='prep'){S.stockLocked?renderStockLock(scr,'prep'):renderPrep(scr);}
   else if(S.screen==='hist')renderHist(scr);
   else if(S.screen==='exp')renderExp(scr);
   else if(S.screen==='att'){renderAtt(scr);}
-  else if(S.screen==='admin'){S.locked?renderLock(scr):renderAdmin(scr);}
+  else if(S.screen==='admin'){S.locked?renderLock(scr,{showThemeReset:true}):renderAdmin(scr);}
   else if(S.screen==='about')renderAbout(scr);
 
   app.appendChild(scr);
@@ -2375,6 +2655,7 @@ function renderTopNav(app){
   [
     {id:'pos',lbl:'POS'},
     {id:'inv',lbl:'Inventory'},
+    {id:'prep',lbl:'Prep'},
     {id:'hist',lbl:'History'},
     {id:'exp',lbl:'Expenses'},
     {id:'att',lbl:'Attendance'},
@@ -2386,6 +2667,9 @@ function renderTopNav(app){
     btn.textContent=t.lbl;
     btn.onclick=function(){
       if(t.id==='admin')S.locked=true;
+      // Inventory and Prep share one unlock, so moving between the two does
+      // not re-prompt — but leaving for any other tab closes it again.
+      if(t.id!=='inv'&&t.id!=='prep')S.stockLocked=true;
       S.screen=t.id;S.cartOpen=false;render();
     };
     tabs.appendChild(btn);
@@ -2841,6 +3125,235 @@ function renderInv(scr){
   scr.appendChild(fab);
 }
 
+/* ==================================================================== *
+ * PREPARATION SCREEN
+ * Two views behind one tab: the raw ingredients a shop holds, and the
+ * recipes that say how much of each a product consumes when it sells.
+ * ==================================================================== */
+function renderPrep(scr){
+  const onIng=S.prepTab!=='rec';
+
+  const hd=document.createElement('div');hd.className='panel-hd';
+  hd.innerHTML='<h2>Preparation</h2>';
+  const addb=document.createElement('button');addb.className='abtn';
+  addb.textContent=onIng?'+ Ingredient':'+ Recipe';
+  const openAdd=function(){
+    if(onIng)openModal({type:'ing',ing:null});
+    else openModal({type:'recipe',rec:null});
+  };
+  addb.onclick=openAdd;
+  hd.appendChild(addb);scr.appendChild(hd);
+
+  const bar=document.createElement('div');bar.className='hist-bar';
+  [{id:'ing',lbl:'Ingredients'},{id:'rec',lbl:'Recipes'}].forEach(function(t){
+    const p=document.createElement('button');
+    p.className='hpill'+((onIng?'ing':'rec')===t.id?' on':'');
+    p.textContent=t.lbl;
+    p.onclick=function(){S.prepTab=t.id;render();};
+    bar.appendChild(p);
+  });
+  scr.appendChild(bar);
+
+  if(onIng)renderPrepIngredients(scr);
+  else renderPrepRecipes(scr);
+
+  const fab=document.createElement('button');fab.className='add-fab';fab.textContent='+';
+  fab.setAttribute('aria-label',onIng?'Add ingredient':'Add recipe');
+  fab.onclick=openAdd;
+  scr.appendChild(fab);
+}
+
+function prepStats(scr,rows){
+  const stats=document.createElement('div');stats.className='stats';
+  rows.forEach(function(s){
+    const d=document.createElement('div');d.className='stat';
+    const l=document.createElement('div');l.className='stat-l';l.textContent=s.l;
+    const v=document.createElement('div');v.className='stat-v';v.textContent=s.v;
+    if(s.c){l.style.color=s.c;v.style.color=s.c;}
+    d.appendChild(l);d.appendChild(v);stats.appendChild(d);
+  });
+  scr.appendChild(stats);
+}
+
+function renderPrepIngredients(scr){
+  prepStats(scr,[
+    {l:'Ingredients',v:S.ings.length,c:''},
+    {l:'Low stock',v:lowIngs().length,c:'var(--wt)'},
+    {l:'Out of stock',v:outIngs().length,c:'var(--dt)'}
+  ]);
+
+  const list=document.createElement('div');list.className='prep-list';
+
+  // The list repaints on its own so typing in the box never loses focus —
+  // a full render() would tear the input out of the DOM on every keystroke.
+  const paint=function(){
+    list.innerHTML='';
+    const q=(S.prepSearch||'').trim().toLowerCase();
+    const rows=S.ings.filter(function(i){
+      if(q&&String(i.name||'').toLowerCase().indexOf(q)<0)return false;
+      if(S.ingFilter==='low')return ingLevel(i)==='low';
+      if(S.ingFilter==='out')return ingLevel(i)==='out';
+      return true;
+    });
+
+    if(!rows.length){
+      const em=document.createElement('div');em.className='prep-empty';
+      if(!S.ings.length){
+        em.innerHTML='<strong>No ingredients yet</strong>Add the raw stock you buy — coffee beans, milk, flour — then link it to products under Recipes so it comes off automatically with every sale.';
+      } else {
+        em.innerHTML='<strong>Nothing matches</strong>Try a different search or filter.';
+      }
+      list.appendChild(em);return;
+    }
+
+    rows.forEach(function(ing){
+      const lvl=ingLevel(ing);
+      const row=document.createElement('div');row.className='inv-row';
+
+      const ic=document.createElement('div');ic.className='inv-ico';
+      ic.textContent=(ing.unit||'ea').slice(0,4).toUpperCase();
+      row.appendChild(ic);
+
+      const info=document.createElement('div');info.className='inv-info';
+      const nm=document.createElement('div');nm.className='inv-name';nm.textContent=ing.name;
+      const sub=document.createElement('div');sub.className='inv-cat';
+      const bits=[];
+      if(+ing.low>0)bits.push('Alerts at '+ingQtyStr(ing.low,ing.unit));
+      if(+ing.cost>0)bits.push(fmt(ing.cost)+' per '+(ing.unit||'unit'));
+      const used=S.recipes.filter(function(r){return r.ingId===ing.id;}).length;
+      bits.push(used===1?'used in 1 product':'used in '+used+' products');
+      sub.textContent=bits.join(' · ');
+      info.appendChild(nm);info.appendChild(sub);row.appendChild(info);
+
+      const ir=document.createElement('div');ir.className='inv-r';
+      const st=document.createElement('div');st.className='ing-stock';
+      st.textContent=ingQtyStr(ing.stock,ing.unit);
+      ir.appendChild(st);
+
+      const badge=document.createElement('span');
+      badge.className='badge '+(lvl==='out'?'b-out':lvl==='low'?'b-low':'b-ok');
+      badge.textContent=lvl==='out'?'out':lvl==='low'?'low':'ok';
+      ir.appendChild(badge);
+
+      const acts=document.createElement('div');acts.className='acts';
+      const adj=document.createElement('button');adj.className='act';adj.textContent='\u00b1';
+      adj.title='Adjust stock';adj.setAttribute('aria-label','Adjust stock for '+ing.name);
+      adj.onclick=function(){openModal({type:'ingAdjust',ingId:ing.id});};
+      const ed=document.createElement('button');ed.className='act';ed.textContent='ED';
+      ed.title='Edit ingredient';ed.setAttribute('aria-label','Edit '+ing.name);
+      ed.onclick=function(){openModal({type:'ing',ing:JSON.parse(JSON.stringify(ing))});};
+      acts.appendChild(adj);acts.appendChild(ed);ir.appendChild(acts);
+
+      row.appendChild(ir);list.appendChild(row);
+    });
+  };
+
+  const search=document.createElement('div');search.className='pos-search';
+  const si=document.createElement('input');si.placeholder='Search ingredients...';
+  si.value=S.prepSearch||'';si.setAttribute('aria-label','Search ingredients');
+  si.oninput=function(){S.prepSearch=this.value;paint();};
+  search.appendChild(si);scr.appendChild(search);
+
+  const pills=document.createElement('div');pills.className='pos-cats';
+  [{id:'all',lbl:'All'},{id:'low',lbl:'Low'},{id:'out',lbl:'Out'}].forEach(function(f){
+    const c=document.createElement('button');
+    c.className='cat'+(S.ingFilter===f.id?' on':'');
+    c.textContent=f.lbl;
+    c.onclick=function(){
+      S.ingFilter=f.id;
+      pills.querySelectorAll('.cat').forEach(function(x){x.classList.remove('on');});
+      c.classList.add('on');
+      paint();
+    };
+    pills.appendChild(c);
+  });
+  scr.appendChild(pills);
+
+  paint();
+  scr.appendChild(list);
+}
+
+function renderPrepRecipes(scr){
+  // Only products that actually have recipe lines are listed; the rest are
+  // sold from their own stock count and have nothing to show here.
+  const names=[];
+  S.recipes.forEach(function(r){if(names.indexOf(r.prod)<0)names.push(r.prod);});
+  names.sort(function(a,b){return String(a).localeCompare(String(b));});
+
+  let blocked=0;
+  names.forEach(function(n){if(buildable(n)===0)blocked++;});
+
+  prepStats(scr,[
+    {l:'Products linked',v:names.length,c:''},
+    {l:'Recipe lines',v:S.recipes.length,c:''},
+    {l:'Cannot make',v:blocked,c:blocked?'var(--dt)':''}
+  ]);
+
+  const list=document.createElement('div');list.className='prep-list';
+
+  if(!names.length){
+    const em=document.createElement('div');em.className='prep-empty';
+    em.innerHTML=S.ings.length
+      ? '<strong>No recipes yet</strong>A recipe says how much of an ingredient one sale uses — 18 g of beans per espresso, say. Add one and that stock comes off by itself at checkout.'
+      : '<strong>Add ingredients first</strong>Recipes link a product to the raw stock it uses, so there needs to be at least one ingredient to point at.';
+    list.appendChild(em);
+    scr.appendChild(list);return;
+  }
+
+  names.forEach(function(nm){
+    const can=buildable(nm);
+    const known=S.prods.some(function(p){return p.name===nm;});
+
+    const grp=document.createElement('div');grp.className='prep-grp';
+    const gn=document.createElement('div');gn.className='prep-grp-n';gn.textContent=nm;
+    grp.appendChild(gn);
+
+    if(!known){
+      const warn=document.createElement('span');warn.className='prep-yield out';
+      warn.textContent='no such product';
+      warn.title='No product is named "'+nm+'". Rename it here or in Inventory so they match.';
+      grp.appendChild(warn);
+    }
+    const y=document.createElement('span');
+    // null = every line on this product consumes nothing, so there is no
+    // yield to state. Leave it neutral rather than claiming a healthy count.
+    y.className='prep-yield'+(can===null?'':can===0?' out':can<=5?' low':' ok');
+    y.textContent=can===null?'no yield set':'makes '+can;
+    if(can===null)y.title='Every line on this recipe uses a quantity of zero.';
+    grp.appendChild(y);
+    list.appendChild(grp);
+
+    recipesFor(nm).forEach(function(r){
+      const ing=ingById(r.ingId);
+      const line=document.createElement('div');line.className='prep-line';
+
+      const ln=document.createElement('div');ln.className='prep-line-n';
+      const t=document.createElement('div');
+      t.textContent=ing?ing.name:'Missing ingredient';
+      if(!ing)t.className='prep-line-miss';
+      const s=document.createElement('div');s.className='prep-line-s';
+      s.textContent=ing
+        ? ingQtyStr(ing.stock,ing.unit)+' in stock'
+        : 'This ingredient was deleted — remove the line or point it somewhere else.';
+      ln.appendChild(t);ln.appendChild(s);line.appendChild(ln);
+
+      const q=document.createElement('div');q.className='prep-line-q';
+      q.textContent=ingQtyStr(r.qty,ing?ing.unit:'')+' each';
+      line.appendChild(q);
+
+      const acts=document.createElement('div');acts.className='acts';
+      const ed=document.createElement('button');ed.className='act';ed.textContent='ED';
+      ed.setAttribute('aria-label','Edit recipe line');
+      ed.onclick=function(){openModal({type:'recipe',rec:JSON.parse(JSON.stringify(r))});};
+      acts.appendChild(ed);line.appendChild(acts);
+
+      list.appendChild(line);
+    });
+  });
+
+  scr.appendChild(list);
+}
+
 function renderHist(scr){
   const filt=S.sales.filter(s=>{
     const d=new Date(s.date);
@@ -2924,25 +3437,56 @@ function renderHist(scr){
   scr.appendChild(list);
 }
 
-function renderLock(scr){
+/* One lock screen serves Admin, Inventory and Preparation. Everything the
+   three differ on is passed in; the password checked is always S.pass. */
+function renderLock(scr,opts){
+  opts=opts||{};
+  const badge=opts.badge||'ADMIN';
+  const title=opts.title||'Admin access';
+  const sub=opts.sub||'Enter your password to continue.';
+  const onUnlock=opts.onUnlock||function(){S.locked=false;render();};
+
   const w=document.createElement('div');w.className='lock-wrap';
   const card=document.createElement('div');card.className='lock-card';
-  card.innerHTML='<div class="lock-ico">ADMIN</div><h2 style="font-size:20px;font-weight:700;color:#f0f0ec">Admin access</h2><p style="font-size:14px;color:#a8a8a2">Enter your password to continue.</p>';
+  const bd=document.createElement('div');bd.className='lock-ico';bd.textContent=badge;
+  const h=document.createElement('h2');h.style.cssText='font-size:20px;font-weight:700;color:#f0f0ec';h.textContent=title;
+  const p=document.createElement('p');p.style.cssText='font-size:14px;color:#a8a8a2';p.textContent=sub;
+  card.appendChild(bd);card.appendChild(h);card.appendChild(p);
+
   const inp=document.createElement('input');inp.className='lock-inp';inp.type='password';inp.placeholder='Password';inp.maxLength=30;
-  const err=document.createElement('div');err.className='lock-err';
+  inp.setAttribute('aria-label',title);
+  const err=document.createElement('div');err.className='lock-err';err.setAttribute('role','alert');
   const btn=document.createElement('button');btn.className='lock-btn';btn.textContent='Unlock';
   const tryUnlock=function(){
-    if(inp.value===S.pass){S.locked=false;render();}
+    if(inp.value===S.pass){onUnlock();}
     else{err.textContent='Incorrect password.';inp.value='';inp.focus();}
   };
   btn.onclick=tryUnlock;
   inp.onkeydown=function(e){if(e.key==='Enter')tryUnlock();};
-  const resetThemeBtn=document.createElement('button');
-  resetThemeBtn.style.cssText='width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.15);background:transparent;color:#666660;font-size:12px;cursor:pointer;margin-top:-4px';
-  resetThemeBtn.textContent='Reset to dark theme';
-  resetThemeBtn.onclick=function(){S.themeColor='#111110';applyTheme('#111110');save();saveSettingsToCloud();toast('Theme reset to dark');};
-  card.appendChild(inp);card.appendChild(err);card.appendChild(btn);card.appendChild(resetThemeBtn);
+  card.appendChild(inp);card.appendChild(err);card.appendChild(btn);
+
+  // A bad custom theme can leave the app unreadable, and Admin is where the
+  // colour is changed — so the escape hatch belongs on the Admin lock only.
+  if(opts.showThemeReset){
+    const resetThemeBtn=document.createElement('button');
+    resetThemeBtn.style.cssText='width:100%;padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.15);background:transparent;color:#666660;font-size:12px;cursor:pointer;margin-top:-4px';
+    resetThemeBtn.textContent='Reset to dark theme';
+    resetThemeBtn.onclick=function(){S.themeColor='#111110';applyTheme('#111110');save();saveSettingsToCloud();toast('Theme reset to dark');};
+    card.appendChild(resetThemeBtn);
+  }
   w.appendChild(card);scr.appendChild(w);
+  setTimeout(function(){try{inp.focus();}catch(e){}},60);
+}
+
+function renderStockLock(scr,which){
+  renderLock(scr,{
+    badge:which==='prep'?'PREP':'STOCK',
+    title:which==='prep'?'Preparation locked':'Inventory locked',
+    sub:which==='prep'
+      ?'Enter the admin password to manage ingredients and recipes.'
+      :'Enter the admin password to view and edit stock.',
+    onUnlock:function(){S.stockLocked=false;render();}
+  });
 }
 
 function renderAdmin(scr){
@@ -3526,7 +4070,7 @@ function renderModal(app){
         const capturedCash=S.cashTendered;
         if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled){tx.queueNo=S.pendingQueueNo||0;tx.queueStatus='waiting';tx.queueDay=(function(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');})();}S.sales.push(tx);S.salesTotal+=tot();S.cart=[];S.disc=0;S.discType='%';S.cashTendered=0;S.cartOpen=false;S.pendingQueueNo=0;if(typeof __qzBadge==='function')__qzBadge();
         S.selectedCustomer=null;S.chargeToUtang=false;
-        save();syncSaleToCloud(tx);recordCustomerSale(tx);deductIngredients(cartCopy);
+        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy,-1);
         closeModal();
         toast('Sale recorded - '+txid);
         openModal({type:'receiptReady',tx:tx,cashTendered:capturedCash});
@@ -3575,7 +4119,7 @@ function renderModal(app){
         const cartCopy2=[...S.cart];
         if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled){tx.queueNo=S.pendingQueueNo||0;tx.queueStatus='waiting';tx.queueDay=(function(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');})();}S.sales.push(tx);S.salesTotal+=tot();S.cart=[];S.disc=0;S.discType="%";S.cashTendered=0;S.cartOpen=false;S.pendingQueueNo=0;if(typeof __qzBadge==='function')__qzBadge();
         S.selectedCustomer=null;S.chargeToUtang=false;
-        save();syncSaleToCloud(tx);recordCustomerSale(tx);deductIngredients(cartCopy2);
+        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy2,-1);
         closeModal();
         toast('Sale recorded - '+txid);
         openModal({type:'receiptReady',tx:tx,cashTendered:0});
@@ -3661,6 +4205,9 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
           tx.voidedAt=new Date().toISOString();
           S.salesTotal=Math.max(0,S.salesTotal-tx.total);
           tx.items.forEach(it=>{applyStockDelta(it,it.qty);});
+          // Put the recipe ingredients back too, or a voided sale would
+          // permanently lose the stock it consumed.
+          consumeIngredients(tx.items,1);
         }
         save();
         // Sync void to cloud — queues if offline
@@ -3738,6 +4285,261 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       closeModal();
     };
     btns.appendChild(cancel);btns.appendChild(save2);body.appendChild(btns);
+
+  } else if(m.type==='ing'){
+    const isNew=!m.ing;
+    const ii=m.ing||{id:0,name:'',unit:'',stock:0,low:0,cost:0};
+    body.innerHTML='<div class="mtitle">'+(isNew?'Add ingredient':'Edit ingredient')+'</div>';
+    const grid=document.createElement('div');grid.style.cssText='display:flex;flex-direction:column;gap:12px';
+    [{id:'iNm',lbl:'Name',type:'text',val:ii.name,ph:'e.g. Coffee beans'},
+     {id:'iUn',lbl:'Unit',type:'text',val:ii.unit||'',ph:'g, ml, pc, kg'},
+     {id:'iSt',lbl:'Stock on hand',type:'number',val:ii.stock,ph:'0'},
+     {id:'iLo',lbl:'Warn me below (blank = never)',type:'number',val:(+ii.low>0?ii.low:''),ph:''},
+     {id:'iCo',lbl:'Cost per unit (optional)',type:'number',val:(+ii.cost>0?ii.cost:''),ph:'0'}
+    ].forEach(function(f){
+      const mf=document.createElement('div');mf.className='mf';
+      const lb=document.createElement('label');lb.textContent=f.lbl;lb.setAttribute('for',f.id);mf.appendChild(lb);
+      const inp=document.createElement('input');inp.id=f.id;inp.type=f.type;inp.placeholder=f.ph;
+      inp.value=(f.val===undefined||f.val===null)?'':f.val;
+      if(f.type==='number'){inp.min='0';inp.step='any';inp.inputMode='decimal';}
+      if(f.id==='iUn')inp.setAttribute('list','unitOpts');
+      mf.appendChild(inp);grid.appendChild(mf);
+    });
+    const dl=document.createElement('datalist');dl.id='unitOpts';
+    ['g','kg','ml','L','pc','pack','box','bottle','sachet'].forEach(function(u){
+      const o=document.createElement('option');o.value=u;dl.appendChild(o);
+    });
+    grid.appendChild(dl);body.appendChild(grid);
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    if(!isNew){
+      const del=document.createElement('button');del.className='mdel';del.textContent='Delete';
+      del.onclick=function(){
+        const target=ingById(ii.id);
+        const uses=S.recipes.filter(function(r){return r.ingId===ii.id;}).length;
+        uiConfirm('Delete '+ii.name+'?'+(uses?'\nIt is used by '+uses+' recipe line'+(uses>1?'s':'')+', which will be removed too.':''),
+          function(ok){
+            if(!ok)return;
+            S.recipes=S.recipes.filter(function(r){return r.ingId!==ii.id;});
+            S.ings=S.ings.filter(function(x){return x.id!==ii.id;});
+            save();
+            if(target)delIngFromCloud(target);
+            closeModal();toast('Ingredient deleted');
+          },{tone:'dang'});
+      };
+      btns.appendChild(del);
+    }
+    const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+    const ok=document.createElement('button');ok.className='mpri';ok.textContent=isNew?'Add':'Save';
+    ok.onclick=function(){
+      const nm=(document.getElementById('iNm').value||'').trim();
+      if(!nm){toast('Enter an ingredient name');return;}
+      const clash=S.ings.some(function(x){
+        return x.id!==ii.id&&String(x.name||'').trim().toLowerCase()===nm.toLowerCase();
+      });
+      if(clash){toast('An ingredient called '+nm+' already exists');return;}
+      const num=function(id){const v=parseFloat(document.getElementById(id).value);return isNaN(v)||v<0?0:ingRound(v);};
+      const un=(document.getElementById('iUn').value||'').trim();
+      if(isNew){
+        const ing={id:S.ingNid++,cloudId:null,name:nm,unit:un,stock:num('iSt'),low:num('iLo'),cost:num('iCo')};
+        S.ings.push(ing);save();saveIngToCloud(ing);
+        closeModal();toast(nm+' added');
+      } else {
+        const t=ingById(ii.id);
+        if(t){
+          t.name=nm;t.unit=un;t.stock=num('iSt');t.low=num('iLo');t.cost=num('iCo');
+          save();saveIngToCloud(t);
+        }
+        closeModal();toast('Saved');
+      }
+    };
+    btns.appendChild(cancel);btns.appendChild(ok);body.appendChild(btns);
+    setTimeout(function(){try{document.getElementById('iNm').focus();}catch(e){}},100);
+
+  } else if(m.type==='ingAdjust'){
+    const ing=ingById(m.ingId);
+    // The ingredient was deleted while this sheet was queued. Drop the modal
+    // without calling closeModal(), which would re-enter render() from inside
+    // the render pass that is already running.
+    if(!ing){S.modal=null;return;}
+    const ttl=document.createElement('div');ttl.className='mtitle';
+    ttl.textContent='Adjust '+ing.name;body.appendChild(ttl);
+
+    const disp=document.createElement('div');disp.className='cash-disp';
+    const dl2=document.createElement('div');dl2.className='cash-lbl';dl2.textContent='New stock on hand';
+    const dv=document.createElement('div');dv.className='cash-amt';
+    disp.appendChild(dl2);disp.appendChild(dv);body.appendChild(disp);
+
+    const was=ingRound(ing.stock);
+    let val=was;
+
+    const delta=document.createElement('div');
+    delta.style.cssText='font-size:12px;color:var(--t3);text-align:center;min-height:16px';
+
+    // Declared before the quick buttons that write to it.
+    const exact=document.createElement('input');
+    exact.id='iAdj';exact.type='number';exact.min='0';exact.step='any';
+    exact.inputMode='decimal';exact.value=val;
+
+    const paint=function(){
+      dv.textContent=ingQtyStr(val,ing.unit);
+      const d=ingRound(val-was);
+      delta.textContent=d===0
+        ? 'Unchanged \u00b7 '+ingQtyStr(was,ing.unit)+' on hand'
+        : (d>0?'Adding ':'Removing ')+ingQtyStr(Math.abs(d),ing.unit)+' \u00b7 was '+ingQtyStr(was,ing.unit);
+      delta.style.color=d===0?'var(--t3)':(d>0?'var(--st)':'var(--wt)');
+    };
+
+    // Step scales to the amount held, so grams and bottles both stay usable.
+    const step=was>=500?50:was>=100?10:1;
+    const grid=document.createElement('div');grid.className='adj-grid';
+    [-step*10,-step,step,step*10].forEach(function(d){
+      const b=document.createElement('button');
+      b.className='adj-btn'+(d<0?' minus':'');
+      b.textContent=(d>0?'+':'\u2212')+ingQtyStr(Math.abs(d),'');
+      b.onclick=function(){val=Math.max(0,ingRound(val+d));exact.value=val;paint();};
+      grid.appendChild(b);
+    });
+    body.appendChild(grid);
+    body.appendChild(delta);
+
+    const mf=document.createElement('div');mf.className='mf';
+    const lb=document.createElement('label');lb.textContent='Or type the exact amount';lb.setAttribute('for','iAdj');
+    mf.appendChild(lb);
+    exact.oninput=function(){
+      const v=parseFloat(this.value);
+      val=isNaN(v)||v<0?0:ingRound(v);
+      paint();
+    };
+    mf.appendChild(exact);body.appendChild(mf);
+    paint();
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+    const ok=document.createElement('button');ok.className='mpri';ok.textContent='Save stock';
+    ok.onclick=function(){
+      const t=ingById(m.ingId);
+      if(t){t.stock=val;save();saveIngToCloud(t);}
+      closeModal();toast(ing.name+' set to '+ingQtyStr(val,ing.unit));
+    };
+    btns.appendChild(cancel);btns.appendChild(ok);body.appendChild(btns);
+
+  } else if(m.type==='recipe'){
+    const isNew=!m.rec;
+    const rr=m.rec||{id:0,prod:'',ingId:0,qty:''};
+    body.innerHTML='<div class="mtitle">'+(isNew?'Add recipe line':'Edit recipe line')+'</div>';
+
+    if(!S.ings.length){
+      const note=document.createElement('div');
+      note.style.cssText='font-size:14px;color:var(--t2);line-height:1.7';
+      note.textContent='There are no ingredients yet. Add one first, then come back to link it to a product.';
+      body.appendChild(note);
+      const b0=document.createElement('div');b0.className='mbtns';
+      const c0=document.createElement('button');c0.textContent='Close';c0.onclick=closeModal;
+      const g0=document.createElement('button');g0.className='mpri';g0.textContent='Add ingredient';
+      g0.onclick=function(){openModal({type:'ing',ing:null});};
+      b0.appendChild(c0);b0.appendChild(g0);body.appendChild(b0);
+    } else {
+      const grid=document.createElement('div');grid.style.cssText='display:flex;flex-direction:column;gap:12px';
+
+      const pf=document.createElement('div');pf.className='mf';
+      const pl=document.createElement('label');pl.textContent='Product';pl.setAttribute('for','rProd');pf.appendChild(pl);
+      const psel=document.createElement('select');psel.id='rProd';
+      const pnames=[];
+      S.prods.forEach(function(p){if(pnames.indexOf(p.name)<0)pnames.push(p.name);});
+      // Keep a recipe pointing at a renamed or deleted product selectable
+      // rather than silently rewriting it to something else on save.
+      if(rr.prod&&pnames.indexOf(rr.prod)<0)pnames.unshift(rr.prod);
+      pnames.forEach(function(n){
+        const o=document.createElement('option');o.value=n;o.textContent=n;
+        if(n===rr.prod)o.selected=true;
+        psel.appendChild(o);
+      });
+      pf.appendChild(psel);grid.appendChild(pf);
+
+      const gf=document.createElement('div');gf.className='mf';
+      const gl=document.createElement('label');gl.textContent='Ingredient';gl.setAttribute('for','rIng');gf.appendChild(gl);
+      const gsel=document.createElement('select');gsel.id='rIng';
+      S.ings.forEach(function(i){
+        const o=document.createElement('option');o.value=String(i.id);
+        o.textContent=i.name+(i.unit?' ('+i.unit+')':'');
+        if(i.id===rr.ingId)o.selected=true;
+        gsel.appendChild(o);
+      });
+      gf.appendChild(gsel);grid.appendChild(gf);
+
+      const qf=document.createElement('div');qf.className='mf';
+      const ql=document.createElement('label');ql.textContent='Used per item sold';ql.setAttribute('for','rQty');qf.appendChild(ql);
+      const qin=document.createElement('input');qin.id='rQty';qin.type='number';qin.min='0';qin.step='any';
+      qin.inputMode='decimal';qin.placeholder='e.g. 18';qin.value=(rr.qty===''||rr.qty===undefined)?'':rr.qty;
+      qf.appendChild(qin);
+      const hint=document.createElement('div');hint.style.cssText='font-size:12px;color:var(--t3);line-height:1.6';
+      qf.appendChild(hint);
+      const paintHint=function(){
+        const i=ingById(parseInt(gsel.value));
+        const q=parseFloat(qin.value);
+        hint.textContent=(!i||isNaN(q)||q<=0)
+          ? 'How much of this ingredient one sale consumes.'
+          : ingQtyStr(q,i.unit)+' comes off '+i.name+' with every '+psel.value+' sold \u00b7 '+Math.floor((+i.stock||0)/q)+' left to make';
+      };
+      gsel.onchange=paintHint;qin.oninput=paintHint;psel.onchange=paintHint;
+      paintHint();
+      grid.appendChild(qf);body.appendChild(grid);
+
+      const btns=document.createElement('div');btns.className='mbtns';
+      if(!isNew){
+        const del=document.createElement('button');del.className='mdel';del.textContent='Delete';
+        del.onclick=function(){
+          uiConfirm('Remove this recipe line?',function(ok2){
+            if(!ok2)return;
+            const target=S.recipes.filter(function(x){return x.id===rr.id;})[0];
+            S.recipes=S.recipes.filter(function(x){return x.id!==rr.id;});
+            save();
+            if(target)delRecipeFromCloud(target);
+            closeModal();toast('Recipe line removed');
+          },{tone:'dang'});
+        };
+        btns.appendChild(del);
+      }
+      const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+      const ok=document.createElement('button');ok.className='mpri';ok.textContent=isNew?'Add':'Save';
+      ok.onclick=function(){
+        const prod=psel.value;
+        const ingId=parseInt(gsel.value);
+        const qty=parseFloat(qin.value);
+        if(!prod){toast('Choose a product');return;}
+        if(!ingById(ingId)){toast('Choose an ingredient');return;}
+        if(isNaN(qty)||qty<=0){toast('Enter how much is used per sale');return;}
+        // One line per product/ingredient pair — fold a duplicate into the
+        // existing line instead of creating a second one that also deducts.
+        const dupe=S.recipes.filter(function(x){
+          return x.id!==rr.id&&x.prod===prod&&x.ingId===ingId;
+        })[0];
+        if(dupe){
+          dupe.qty=ingRound(qty);
+          if(!isNew){
+            // The edited line now duplicates another, so retire it rather
+            // than leaving two lines that would both deduct on every sale.
+            const stale=S.recipes.filter(function(x){return x.id===rr.id;})[0];
+            S.recipes=S.recipes.filter(function(x){return x.id!==rr.id;});
+            if(stale)delRecipeFromCloud(stale);
+          }
+          save();saveRecipeToCloud(dupe);
+          closeModal();toast('Recipe updated');
+          return;
+        }
+        if(isNew){
+          const r={id:S.recipeNid++,cloudId:null,prod:prod,ingId:ingId,qty:ingRound(qty)};
+          S.recipes.push(r);save();saveRecipeToCloud(r);
+          closeModal();toast('Recipe line added');
+        } else {
+          const t=S.recipes.filter(function(x){return x.id===rr.id;})[0];
+          if(t){t.prod=prod;t.ingId=ingId;t.qty=ingRound(qty);save();saveRecipeToCloud(t);}
+          closeModal();toast('Saved');
+        }
+      };
+      btns.appendChild(cancel);btns.appendChild(ok);body.appendChild(btns);
+    }
 
   } else if(m.type==='expense'){
     body.innerHTML='<div class="mtitle">Add expense</div>';
