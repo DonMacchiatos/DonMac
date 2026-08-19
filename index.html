@@ -294,7 +294,7 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 .auth-wrap{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px 20px;gap:0;background:var(--bg0);overflow-y:auto}
 .auth-card{background:var(--bg1);border:1.5px solid var(--b2);border-radius:20px;padding:28px 24px;width:100%;max-width:340px;display:flex;flex-direction:column;gap:14px}
 .auth-logo{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:4px;text-align:center}
-.auth-logo-img{width:64px;height:64px;border-radius:16px;object-fit:cover;margin:0 auto 10px;display:block}
+.auth-logo-img{width:64px;height:64px;border-radius:16px;object-fit:contain;margin:0 auto 10px;display:block}
 .auth-logo-ico{width:60px;height:60px;border-radius:16px;background:var(--ac);display:flex;align-items:center;justify-content:center;font-size:22px;font-weight:800;color:#fff}
 .auth-title{font-size:18px;font-weight:700}
 .auth-sub{font-size:13px;color:var(--t2)}
@@ -318,7 +318,7 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 .cart-foot, .admin-scroll { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
 
 /* Brand logo in nav */
-.brand-logo{width:32px;height:32px;border-radius:8px;object-fit:cover;flex-shrink:0}
+.brand-logo{width:32px;height:32px;border-radius:8px;object-fit:contain;flex-shrink:0}
 .brand-logo-ph{width:32px;height:32px;border-radius:8px;background:var(--ac2);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:var(--ac);flex-shrink:0}
 
 /* Online/Offline status */
@@ -366,8 +366,8 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 .disc-quick{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px}
 .disc-qbtn{padding:6px 12px;border-radius:20px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t2);font-size:12px;font-weight:700;cursor:pointer;white-space:nowrap}
 .disc-qbtn:active,.disc-qbtn.active{background:var(--ac);color:#fff;border-color:var(--ac)}
-.pimg{width:52px;height:52px;border-radius:8px;object-fit:cover;flex-shrink:0}
-.inv-img{width:44px;height:44px;border-radius:8px;object-fit:cover;flex-shrink:0;border:1px solid var(--b1)}
+.pimg{width:52px;height:52px;border-radius:8px;object-fit:contain;flex-shrink:0}
+.inv-img{width:44px;height:44px;border-radius:8px;object-fit:contain;background:var(--bg3);flex-shrink:0;border:1px solid var(--b1)}
 
 /* Item notes in cart */
 .ci-note{font-size:11px;color:var(--t3);margin-top:2px;font-style:italic}
@@ -391,11 +391,11 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 /* Logo upload area */
 .logo-upload-area{border:2px dashed var(--b2);border-radius:14px;padding:20px;display:flex;flex-direction:column;align-items:center;gap:10px;cursor:pointer;text-align:center}
 .logo-upload-area:active{background:var(--bg3)}
-.logo-preview{width:72px;height:72px;border-radius:14px;object-fit:cover;border:2px solid var(--b2)}
+.logo-preview{width:72px;height:72px;border-radius:14px;object-fit:contain;background:var(--bg3);border:2px solid var(--b2)}
 .logo-hint{font-size:12px;color:var(--t3);line-height:1.6}
 
 /* Product image upload */
-.img-upload-thumb{width:64px;height:64px;border-radius:10px;object-fit:cover;border:1.5px solid var(--b2)}
+.img-upload-thumb{width:64px;height:64px;border-radius:10px;object-fit:contain;background:var(--bg3);border:1.5px solid var(--b2)}
 .img-upload-row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .img-upload-btn{padding:10px 14px;border-radius:10px;border:1.5px dashed var(--b2);background:var(--bg2);color:var(--t2);font-size:13px;font-weight:600;cursor:pointer}
 
@@ -541,7 +541,7 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
   width: 100%;
   flex: 1 1 auto;
   min-height: 0;
-  object-fit: cover;
+  object-fit: contain;
   border-radius: var(--r-sm);
   background: var(--bg3);
   margin-bottom: 3px;
@@ -1984,6 +1984,69 @@ function load(){
   applyTheme(S.themeColor);
 }
 
+/* ==================================================================== *
+ * PHOTO HANDLING
+ *
+ * Uploads used to be stored exactly as the camera produced them — a phone
+ * photo is several megabytes once base64-encoded, and localStorage holds
+ * roughly five in total for the whole app. Two unprocessed photos could
+ * fill it, at which point save() started throwing and the till silently
+ * stopped persisting sales. Every picture is now scaled down to something
+ * a 3-column grid can actually use before it is ever stored.
+ *
+ * Aspect ratio is preserved rather than cropped: a tall bottle and a wide
+ * tray both keep all of themselves, and the CSS letterboxes them into the
+ * card. Nothing is cut off and nothing is stretched.
+ * ==================================================================== */
+const IMG_MAX_EDGE=512;     // ample for a product tile on a 2x phone screen
+const IMG_LOGO_EDGE=256;
+const IMG_QUALITY=0.82;
+
+// base64 characters -> approximate kilobytes of real data
+function imgKB(chars){return Math.max(1,Math.round((chars||0)*0.75/1024));}
+
+function processImage(file,maxEdge){
+  return new Promise(function(resolve,reject){
+    if(!file)return reject(new Error('No file chosen'));
+    if(!/^image\//.test(file.type||''))return reject(new Error('That file is not an image'));
+    const reader=new FileReader();
+    reader.onerror=function(){reject(new Error('Could not read that file'));};
+    reader.onload=function(ev){
+      const src=String(ev.target.result||'');
+      const img=new Image();
+      img.onerror=function(){reject(new Error('That image could not be opened'));};
+      img.onload=function(){
+        const w=img.naturalWidth||img.width, h=img.naturalHeight||img.height;
+        if(!w||!h)return reject(new Error('That image has no size'));
+        // Shrink the longest edge to the limit. Never scale a small picture
+        // up — that adds bytes without adding any detail.
+        const scale=Math.min(1,(maxEdge||IMG_MAX_EDGE)/Math.max(w,h));
+        const tw=Math.max(1,Math.round(w*scale)), th=Math.max(1,Math.round(h*scale));
+        let out;
+        try{
+          const c=document.createElement('canvas');
+          c.width=tw;c.height=th;
+          const ctx=c.getContext('2d');
+          if(!ctx)throw new Error('no 2d context');
+          ctx.imageSmoothingEnabled=true;
+          if('imageSmoothingQuality' in ctx)ctx.imageSmoothingQuality='high';
+          // White underlay so a transparent PNG does not turn black once
+          // it is flattened into a JPEG.
+          ctx.fillStyle='#ffffff';ctx.fillRect(0,0,tw,th);
+          ctx.drawImage(img,0,0,tw,th);
+          out=c.toDataURL('image/jpeg',IMG_QUALITY);
+        }catch(e){return reject(new Error('This browser could not resize that image'));}
+        // A already-tiny source can come out larger after re-encoding, so
+        // keep whichever is smaller. Processing never makes things worse.
+        const best=(out&&out.length<src.length)?out:src;
+        resolve({data:best,w:tw,h:th,before:src.length,after:best.length});
+      };
+      img.src=src;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
 function save(){
   try{
     localStorage.setItem('arroyo_pos',JSON.stringify({
@@ -1997,7 +2060,16 @@ function save(){
       ings:S.ings,ingNid:S.ingNid,recipes:S.recipes,recipeNid:S.recipeNid
     }));
     if(CLOUD.token)localStorage.setItem('arroyo_cloud',JSON.stringify({user:CLOUD.user,token:CLOUD.token,refresh:CLOUD.refresh,bizId:CLOUD.bizId,email:S.cloudEmail,bizName:S.cloudBizName}));
-  }catch(e){}
+  }catch(e){
+    /* A full quota used to be swallowed here, so the till looked like it
+       was working while nothing was actually being written — sales would
+       disappear on the next refresh. Say so instead. */
+    const full=e&&(e.name==='QuotaExceededError'||e.name==='NS_ERROR_DOM_QUOTA_REACHED'||e.code===22||e.code===1014);
+    console.error('[Arroyo] save failed:',e);
+    if(full&&typeof toast==='function'){
+      toast('Device storage is full — remove a product photo, then sync');
+    }
+  }
 }
 
 function applyTheme(hex){
@@ -2377,7 +2449,7 @@ function printReceipt(tx){
     // Header
     +'<div class="center">'
     +(S.bizLogo
-      ?'<img src="'+S.bizLogo+'" style="width:48px;height:48px;border-radius:8px;object-fit:cover;margin-bottom:4px"><br>'
+      ?'<img src="'+S.bizLogo+'" style="width:48px;height:48px;border-radius:8px;object-fit:contain;margin-bottom:4px"><br>'
       :'<div style="font-size:20px;font-weight:800;border:2px solid #000;display:inline-block;padding:4px 10px;border-radius:6px;margin-bottom:4px">'+bizInitials+'</div><br>'
     )
     +'<div class="biz-name">'+S.bizName+'</div>'
@@ -2843,7 +2915,7 @@ function renderCloudAuth(app){
 
 function renderCashierLogin(app){
   const w=document.createElement('div');w.style.cssText='flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px 20px;gap:16px;background:var(--bg0)';
-  if(S.bizLogo){const lg=document.createElement('img');lg.src=S.bizLogo;lg.style.cssText='width:72px;height:72px;border-radius:16px;object-fit:cover;border:2px solid var(--b2)';w.appendChild(lg);}
+  if(S.bizLogo){const lg=document.createElement('img');lg.src=S.bizLogo;lg.style.cssText='width:72px;height:72px;border-radius:16px;object-fit:contain;border:2px solid var(--b2)';w.appendChild(lg);}
   const ttl=document.createElement('div');ttl.style.cssText='font-size:20px;font-weight:800;text-align:center';ttl.textContent=S.bizName;w.appendChild(ttl);
   const hint=document.createElement('div');hint.style.cssText='font-size:13px;color:var(--t2)';hint.textContent='Select your name to start shift';w.appendChild(hint);
   const list=document.createElement('div');list.style.cssText='width:100%;max-width:320px;display:flex;flex-direction:column;gap:8px';
@@ -3951,7 +4023,16 @@ function renderAdmin(scr){
     secLogo.appendChild(logoArea);
   }
   const logoFileInp=document.createElement('input');logoFileInp.type='file';logoFileInp.accept='image/*';logoFileInp.style.display='none';
-  logoFileInp.onchange=function(){const file=this.files[0];if(!file)return;const reader=new FileReader();reader.onload=function(ev){S.bizLogo=ev.target.result;save();saveSettingsToCloud();render();toast('Logo uploaded!');};reader.readAsDataURL(file);};
+  logoFileInp.onchange=function(){
+    const file=this.files&&this.files[0];
+    this.value='';
+    if(!file)return;
+    toast('Fitting logo...');
+    processImage(file,IMG_LOGO_EDGE).then(function(r){
+      S.bizLogo=r.data;save();saveSettingsToCloud();render();
+      toast('Logo fitted \u2014 '+imgKB(r.before)+' KB down to '+imgKB(r.after)+' KB');
+    }).catch(function(e){toast(e.message);});
+  };
   logoArea.onclick=function(){logoFileInp.click();};secLogo.appendChild(logoFileInp);scroll.appendChild(secLogo);
 
   // ── Cashiers ──
@@ -5051,18 +5132,59 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const imgRow=document.createElement('div');imgRow.className='img-upload-row';
     const imgPrev=document.createElement('div');
     let pendingImg=pp.img||null;
-    if(pp.img){const im=document.createElement('img');im.src=pp.img;im.className='img-upload-thumb';imgPrev.appendChild(im);}
-    else{imgPrev.style.cssText='width:64px;height:64px;border-radius:10px;border:1.5px dashed var(--b2);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--t3)';imgPrev.textContent='📷';}
-    const imgBtn=document.createElement('div');imgBtn.className='img-upload-btn';imgBtn.textContent='Upload photo';
+    const imgBtn=document.createElement('div');imgBtn.className='img-upload-btn';
+    const remImg=document.createElement('button');remImg.className='abtn';remImg.textContent='Remove';
+    remImg.style.cssText='font-size:11px;padding:5px 10px';
+    const imgNote=document.createElement('div');
+    imgNote.style.cssText='font-size:11px;color:var(--t3);width:100%;line-height:1.6';
+
+    const PLACEHOLDER='width:64px;height:64px;border-radius:10px;border:1.5px dashed var(--b2);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--t3)';
+    // One place that draws the preview, so the upload and remove paths
+    // cannot drift into showing different things.
+    const paintThumb=function(){
+      imgPrev.innerHTML='';
+      if(pendingImg){
+        imgPrev.style.cssText='';
+        const im=document.createElement('img');im.src=pendingImg;im.className='img-upload-thumb';
+        im.onerror=function(){this.style.display='none';};
+        imgPrev.appendChild(im);
+        imgBtn.textContent='Change photo';
+        remImg.style.display='';
+      } else {
+        imgPrev.style.cssText=PLACEHOLDER;
+        imgPrev.textContent='\uD83D\uDCF7';
+        imgBtn.textContent='Upload photo';
+        remImg.style.display='none';
+      }
+    };
+
     const imgInp=document.createElement('input');imgInp.type='file';imgInp.accept='image/*';imgInp.style.display='none';
     imgInp.onchange=function(){
-      const file=this.files[0];if(!file)return;
-      const reader=new FileReader();reader.onload=function(ev){pendingImg=ev.target.result;imgPrev.innerHTML='';const im=document.createElement('img');im.src=pendingImg;im.className='img-upload-thumb';imgPrev.appendChild(im);};reader.readAsDataURL(file);
+      const file=this.files&&this.files[0];
+      // Clear the input so picking the same file twice still fires onchange.
+      this.value='';
+      if(!file)return;
+      imgBtn.textContent='Fitting photo...';
+      imgNote.style.color='var(--t3)';
+      imgNote.textContent='Resizing so it fits the tile...';
+      processImage(file,IMG_MAX_EDGE).then(function(r){
+        pendingImg=r.data;
+        paintThumb();
+        imgNote.style.color='var(--t3)';
+        imgNote.textContent='Fitted to '+r.w+'\u00d7'+r.h+' \u00b7 '+imgKB(r.before)+' KB down to '+imgKB(r.after)+' KB';
+      }).catch(function(e){
+        paintThumb();
+        imgNote.style.color='var(--dt)';
+        imgNote.textContent=e.message;
+      });
     };
+    remImg.onclick=function(){pendingImg=null;paintThumb();imgNote.textContent='';};
     imgBtn.onclick=function(){imgInp.click();};
-    imgRow.appendChild(imgPrev);imgRow.appendChild(imgBtn);
-    if(pp.img){const remImg=document.createElement('button');remImg.className='abtn';remImg.textContent='Remove';remImg.style.cssText='font-size:11px;padding:5px 10px';remImg.onclick=function(){pendingImg=null;imgPrev.innerHTML='';imgPrev.style.cssText='width:64px;height:64px;border-radius:10px;border:1.5px dashed var(--b2);display:flex;align-items:center;justify-content:center;font-size:22px;color:var(--t3)';imgPrev.textContent='📷';};imgRow.appendChild(remImg);}
-    imgRow.appendChild(imgInp);imgMf.appendChild(imgRow);grid.appendChild(imgMf);
+
+    paintThumb();
+    imgRow.appendChild(imgPrev);imgRow.appendChild(imgBtn);imgRow.appendChild(remImg);
+    imgRow.appendChild(imgInp);
+    imgMf.appendChild(imgRow);imgMf.appendChild(imgNote);grid.appendChild(imgMf);
 
     [{id:'pNm',lbl:'Name',type:'text',val:pp.name,ph:'Product name'},{id:'pPr',lbl:'Price (original / regular)',type:'number',val:pp.price,ph:'0'},{id:'pSt',lbl:'Stock (blank = unlimited)',type:'number',val:pp.stock===999?'':pp.stock,ph:''},{id:'pBc',lbl:'Barcode / SKU (scan or type)',type:'text',val:pp.barcode||'',ph:'Scan barcode here'}].forEach(f=>{
       const mf=document.createElement('div');mf.className='mf';mf.innerHTML='<label>'+f.lbl+'</label>';
