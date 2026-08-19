@@ -824,6 +824,59 @@ textarea:focus-visible,
 
 </style>
 <style>
+/* ---- PAYMENT BREAKDOWN — history totals split by tender ------------- */
+.paysum {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+  gap: 8px;
+  padding: 0 16px 12px;
+  flex-shrink: 0;
+}
+.paycell {
+  background: var(--bg2);
+  border: 1px solid var(--edge);
+  border-radius: var(--r-md);
+  padding: 11px 12px;
+  box-shadow: var(--lift);
+}
+.paycell-l {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .6px;
+  margin-bottom: 4px;
+}
+.paycell-v {
+  font-size: 17px;
+  font-weight: 800;
+  letter-spacing: -.3px;
+  font-variant-numeric: tabular-nums;
+}
+.paycell-n { font-size: 11px; color: var(--t3); margin-top: 2px; }
+
+/* Credit is money owed, not money taken, so it is set apart from the rest. */
+.paycell.credit { border-style: dashed; border-color: var(--wg); }
+
+.paysum-note {
+  padding: 0 16px 10px;
+  font-size: 11.5px;
+  color: var(--t3);
+  line-height: 1.6;
+  flex-shrink: 0;
+}
+
+/* Per-day tender line inside a history group. */
+.day-pay {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  color: var(--t3);
+  margin: -4px 0 10px;
+}
+.day-pay span { white-space: nowrap; }
+.day-pay b { font-weight: 800; font-variant-numeric: tabular-nums; }
+
 /* ---- PREPARATION — ingredients and recipes --------------------------- */
 /* Reuses .inv-row, .stat, .badge and .hpill so this screen reads as part of
    the same app; only what genuinely has no equivalent is defined here. */
@@ -1112,13 +1165,22 @@ async function flushSyncQueue(logFn){
   return pushed;
 }
 
+// Single definition of the sales row shape. Both the per-sale push and the
+// bulk reconciliation use it, so the two cannot drift apart.
+function salePayload(tx,bizId){
+  return {biz_id:bizId||null,txn_id:tx.id,date:tx.date,total:tx.total,method:tx.method,
+    items:tx.items,discount:tx.disc||0,cashier:tx.cashier||'',ref:tx.ref||'',
+    voided:tx.voided||false,queue_no:tx.queueNo||null,queue_status:tx.queueStatus||'',
+    queue_day:tx.queueDay||null};
+}
+
 async function syncSaleToCloud(tx){
   if(!CLOUD.token||!CLOUD.bizId){
     // Not connected — queue for later
-    queueAdd('sale',{biz_id:null,txn_id:tx.id,date:tx.date,total:tx.total,method:tx.method,items:tx.items,discount:tx.disc||0,cashier:tx.cashier||'',ref:tx.ref||'',voided:tx.voided||false,queue_no:tx.queueNo||null,queue_status:tx.queueStatus||'',queue_day:tx.queueDay||null});
+    queueAdd('sale',salePayload(tx,null));
     return;
   }
-  const payload={biz_id:CLOUD.bizId,txn_id:tx.id,date:tx.date,total:tx.total,method:tx.method,items:tx.items,discount:tx.disc||0,cashier:tx.cashier||'',ref:tx.ref||'',voided:tx.voided||false,queue_no:tx.queueNo||null,queue_status:tx.queueStatus||'',queue_day:tx.queueDay||null};
+  const payload=salePayload(tx,CLOUD.bizId);
   try{
     const r=await fetch(SUPA_URL+'/rest/v1/sales',{method:'POST',headers:cloudHeaders(),body:JSON.stringify(payload)});
     if(!r.ok&&r.status!==409){
@@ -1550,6 +1612,214 @@ async function loadSettingsFromCloud(){
     save();
   }catch(e){}
 }
+/* ==================================================================== *
+ * FULL SYNC — push everything this till holds up to the Dashboard.
+ *
+ * The per-action pushes already queue on failure, but a queue lives in
+ * localStorage and can be cleared, and a sale recorded before a device was
+ * ever signed in has nothing to queue against. So rather than trusting the
+ * queue alone, this reconciles: it reads what the cloud already has and
+ * sends only what is missing. Running it twice is harmless.
+ * ==================================================================== */
+
+function chunkList(arr,n){
+  const out=[];
+  for(let i=0;i<arr.length;i+=n)out.push(arr.slice(i,i+n));
+  return out;
+}
+
+// Ingredients and recipes made on this device carry no cloud id until they
+// are pushed, so they are what a full sync has to chase.
+function unsyncedPrepCount(){
+  let n=0;
+  S.ings.forEach(function(i){if(i.cloudId===null||i.cloudId===undefined)n++;});
+  S.recipes.forEach(function(r){if(r.cloudId===null||r.cloudId===undefined)n++;});
+  return n;
+}
+
+async function reconcileSales(log){
+  const stat={pushed:0,failed:0,voidsFixed:0,readOk:false};
+  let rows=null;
+  try{
+    const r=await fetch(SUPA_URL+'/rest/v1/sales?biz_id=eq.'+CLOUD.bizId+'&select=txn_id,voided&limit=10000',
+      {headers:cloudHeaders()});
+    if(r.ok)rows=await r.json();
+  }catch(e){}
+  if(!Array.isArray(rows)){
+    log('Could not read cloud sales - skipped the sales check',false);
+    return stat;
+  }
+  stat.readOk=true;
+
+  const cloudVoid={};
+  rows.forEach(function(x){cloudVoid[String(x.txn_id)]=!!x.voided;});
+
+  const missing=S.sales.filter(function(s){return !(String(s.id) in cloudVoid);});
+  // A void recorded here while the cloud copy still reads as a live sale
+  // would otherwise overstate takings on the Dashboard.
+  const staleVoids=S.sales.filter(function(s){
+    return s.voided&&(String(s.id) in cloudVoid)&&cloudVoid[String(s.id)]===false;
+  });
+
+  if(!missing.length){
+    log('All '+S.sales.length+' local sales are already on the Dashboard',true);
+  } else {
+    log('Found '+missing.length+' sale(s) missing from the Dashboard...');
+    const batches=chunkList(missing.map(function(s){return salePayload(s,CLOUD.bizId);}),50);
+    for(let b=0;b<batches.length;b++){
+      let ok=false;
+      try{
+        const r=await fetch(SUPA_URL+'/rest/v1/sales',
+          {method:'POST',headers:cloudHeaders(),body:JSON.stringify(batches[b])});
+        ok=r.ok;
+      }catch(e){}
+      if(ok){stat.pushed+=batches[b].length;continue;}
+      // One bad row fails a whole batch, so fall back to a row at a time.
+      for(let i=0;i<batches[b].length;i++){
+        try{
+          const r2=await fetch(SUPA_URL+'/rest/v1/sales',
+            {method:'POST',headers:cloudHeaders(),body:JSON.stringify(batches[b][i])});
+          if(r2.ok||r2.status===409)stat.pushed++;else stat.failed++;
+        }catch(e){stat.failed++;}
+      }
+    }
+    log('Pushed '+stat.pushed+' sale(s)'+(stat.failed?', '+stat.failed+' failed':''),stat.failed===0);
+  }
+
+  for(let i=0;i<staleVoids.length;i++){
+    const s=staleVoids[i];
+    try{
+      const r=await fetch(SUPA_URL+'/rest/v1/sales?txn_id=eq.'+encodeURIComponent(s.id)+'&biz_id=eq.'+CLOUD.bizId,
+        {method:'PATCH',headers:cloudHeaders(),
+         body:JSON.stringify({voided:true,voided_by:s.voidedBy||'',voided_at:s.voidedAt||new Date().toISOString()})});
+      if(r.ok)stat.voidsFixed++;
+    }catch(e){}
+  }
+  if(stat.voidsFixed)log('Marked '+stat.voidsFixed+' sale(s) as voided on the Dashboard',true);
+  return stat;
+}
+
+async function reconcileExpenses(log){
+  const stat={pushed:0,failed:0,readOk:false};
+  if(!S.expenses.length){stat.readOk=true;log('No expenses to check',true);return stat;}
+  let rows=null;
+  try{
+    const r=await fetch(SUPA_URL+'/rest/v1/expenses?biz_id=eq.'+CLOUD.bizId+'&select=name,amount,date&limit=10000',
+      {headers:cloudHeaders()});
+    if(r.ok)rows=await r.json();
+  }catch(e){}
+  if(!Array.isArray(rows)){
+    log('Could not read cloud expenses - skipped the expenses check',false);
+    return stat;
+  }
+  stat.readOk=true;
+  // Expenses share no stable id between device and cloud, so match on the
+  // exact creation timestamp plus name. Skipping a genuine duplicate is far
+  // less damaging than posting the same expense twice.
+  const key=function(n,d){return String(n||'')+'|'+String(d||'');};
+  const have={};
+  rows.forEach(function(x){have[key(x.name,x.date)]=true;});
+  const missing=S.expenses.filter(function(e){return !have[key(e.name,e.date)];});
+  if(!missing.length){log('All '+S.expenses.length+' expense(s) are already on the Dashboard',true);return stat;}
+
+  log('Found '+missing.length+' expense(s) missing...');
+  for(let i=0;i<missing.length;i++){
+    const e=missing[i];
+    try{
+      const r=await fetch(SUPA_URL+'/rest/v1/expenses',{method:'POST',headers:cloudHeaders(),
+        body:JSON.stringify({biz_id:CLOUD.bizId,name:e.name,amount:e.amount,cat:e.cat,date:e.date})});
+      if(r.ok)stat.pushed++;else stat.failed++;
+    }catch(err){stat.failed++;}
+  }
+  log('Pushed '+stat.pushed+' expense(s)'+(stat.failed?', '+stat.failed+' failed':''),stat.failed===0);
+  return stat;
+}
+
+async function pushPrepData(log){
+  const stat={ings:0,recipes:0};
+  if(!S.ings.length&&!S.recipes.length){log('No ingredients or recipes to push',true);return stat;}
+  // Ingredients first: a recipe cannot be written until the ingredient it
+  // points at has a cloud id to reference.
+  for(let i=0;i<S.ings.length;i++){
+    await saveIngToCloud(S.ings[i]);
+    if(S.ings[i].cloudId!==null&&S.ings[i].cloudId!==undefined)stat.ings++;
+  }
+  if(S.ings.length)log('Pushed '+stat.ings+' of '+S.ings.length+' ingredient(s)',stat.ings===S.ings.length);
+  for(let j=0;j<S.recipes.length;j++){
+    await saveRecipeToCloud(S.recipes[j]);
+    if(S.recipes[j].cloudId!==null&&S.recipes[j].cloudId!==undefined)stat.recipes++;
+  }
+  if(S.recipes.length)log('Pushed '+stat.recipes+' of '+S.recipes.length+' recipe line(s)',stat.recipes===S.recipes.length);
+  return stat;
+}
+
+/* Runs the whole push. log(msg, ok) receives progress; ok is true for a
+   success line, false for a failure, undefined for plain progress. */
+async function syncEverything(log){
+  log=log||function(){};
+  if(!CLOUD.token||!CLOUD.bizId){
+    log('Not signed in. Open Admin and sign in to the cloud first.',false);
+    return {ok:false,reason:'signed-out'};
+  }
+  if(!navigator.onLine){
+    log('This device is offline. Reconnect and try again - nothing is lost in the meantime.',false);
+    return {ok:false,reason:'offline'};
+  }
+
+  log('Checking session...');
+  const authed=await ensureAuth();
+  if(!authed){log('Session could not be renewed.',false);return {ok:false,reason:'auth'};}
+  log('Session OK',true);
+
+  const pending=queueCount();
+  if(pending>0){
+    log('Pushing '+pending+' queued item(s)...');
+    await flushSyncQueue(log);
+  } else {
+    log('Nothing waiting in the offline queue',true);
+  }
+
+  const sales=await reconcileSales(log);
+  const exps=await reconcileExpenses(log);
+  const failed=sales.failed+exps.failed;
+  // A failed *read* is as dangerous as a failed write: it means this run
+  // never established what the Dashboard already holds, so it cannot know
+  // whether the local records are safely up there. Pulling on that basis
+  // could replace them with an empty or partial result.
+  const blind=!sales.readOk||!exps.readOk;
+
+  /* Anything that downloads has to wait until every upload has landed.
+     loadCloudData() replaces S.sales and S.expenses outright, and
+     saveProductsToCloud() quietly falls back to a full download when this
+     device has no products — so both are off limits while records are still
+     unsent, or the pull would erase exactly what failed to go up.
+     Pushing settings and prep data is still safe: neither reads anything
+     back. A stale local copy is recoverable; a deleted sale is not. */
+  if(failed>0||blind){
+    if(failed>0)log('Finished with '+failed+' item(s) still unsent.',false);
+    await saveSettingsToCloud();
+    await pushPrepData(log);
+    log('Held back the download so nothing on this device is overwritten. Try again in a moment.','warn');
+    save();
+    return {ok:false,sales:sales,expenses:exps,reason:failed>0?'partial':'unverified'};
+  }
+
+  log('Pushing '+S.prods.length+' product(s)...');
+  const prodOk=await saveProductsToCloud();
+  log(prodOk?'Products pushed':'Products failed to push',prodOk);
+
+  const setOk=await saveSettingsToCloud();
+  log(setOk?'Shop settings pushed':'Settings failed to push (non-critical)',setOk);
+
+  await pushPrepData(log);
+
+  log('Pulling the latest back from the Dashboard...');
+  await loadCloudData(true);
+  save();
+  log('Everything on this device is now on the Dashboard.',true);
+  return {ok:prodOk,sales:sales,expenses:exps,reason:''};
+}
+
 const BT=[
   {id:'food',label:'Food & dining',icon:'FOOD'},
   {id:'cafe',label:'Cafe',icon:'CAFE'},
@@ -1588,8 +1858,8 @@ let S={
   // Preparation: raw ingredients and the recipes that link them to products.
   ings:[],ingNid:1,recipes:[],recipeNid:1,
   prepTab:'ing',prepSearch:'',ingFilter:'all',
-  // Inventory and Preparation both edit stock, so one admin unlock covers
-  // both. Deliberately not persisted — it re-locks on every app launch.
+  // Guards the Inventory tab. Deliberately not persisted — it re-locks on
+  // every app launch. Preparation is open to all staff.
   stockLocked:true,
   cloudEmail:'',cloudBizName:'',
   authScreen:'login',
@@ -2211,8 +2481,8 @@ function render(){
     if(S.cartOpen)renderCart(scr);
     else renderPOS(scr);
   }
-  else if(S.screen==='inv'){S.stockLocked?renderStockLock(scr,'inv'):renderInv(scr);}
-  else if(S.screen==='prep'){S.stockLocked?renderStockLock(scr,'prep'):renderPrep(scr);}
+  else if(S.screen==='inv'){S.stockLocked?renderStockLock(scr):renderInv(scr);}
+  else if(S.screen==='prep')renderPrep(scr);
   else if(S.screen==='hist')renderHist(scr);
   else if(S.screen==='exp')renderExp(scr);
   else if(S.screen==='att'){renderAtt(scr);}
@@ -2667,9 +2937,9 @@ function renderTopNav(app){
     btn.textContent=t.lbl;
     btn.onclick=function(){
       if(t.id==='admin')S.locked=true;
-      // Inventory and Prep share one unlock, so moving between the two does
-      // not re-prompt — but leaving for any other tab closes it again.
-      if(t.id!=='inv'&&t.id!=='prep')S.stockLocked=true;
+      // Inventory re-locks the moment it is left. Prep is no longer behind
+      // the password, so stepping across to it counts as leaving.
+      if(t.id!=='inv')S.stockLocked=true;
       S.screen=t.id;S.cartOpen=false;render();
     };
     tabs.appendChild(btn);
@@ -3354,6 +3624,92 @@ function renderPrepRecipes(scr){
   scr.appendChild(list);
 }
 
+/* ==================================================================== *
+ * PAYMENT BREAKDOWN
+ * Splits takings by how they were paid. Cash, GCash and Card are always
+ * shown so the layout stays put between filters; credit and any legacy
+ * tender only appear when there is something to report.
+ * ==================================================================== */
+const PAY_METHODS=[
+  {id:'Cash', lbl:'Cash',  c:'var(--st)', always:true},
+  {id:'GCash',lbl:'GCash', c:'var(--pt)', always:true},
+  {id:'Card', lbl:'Card',  c:'var(--ac)', always:true},
+  {id:'Utang',lbl:'Credit',c:'var(--wt)', always:false, credit:true},
+];
+
+/* Voided sales are excluded — they took no money. Anything with an
+   unrecognised method still gets counted rather than silently dropped. */
+function tallyByMethod(txs){
+  const t={};
+  PAY_METHODS.forEach(function(p){t[p.id]={count:0,total:0};});
+  (txs||[]).forEach(function(s){
+    if(s.voided)return;
+    const k=s.method||'Cash';
+    if(!t[k])t[k]={count:0,total:0};
+    t[k].count++;
+    t[k].total+=(+s.total||0);
+  });
+  return t;
+}
+
+// Ordered list of the methods worth displaying for this set of sales.
+function methodRows(tally){
+  const rows=[];
+  PAY_METHODS.forEach(function(p){
+    if(p.always||tally[p.id].count>0)rows.push({...p,d:tally[p.id]});
+  });
+  Object.keys(tally).forEach(function(k){
+    if(PAY_METHODS.some(function(p){return p.id===k;}))return;
+    if(tally[k].count>0)rows.push({id:k,lbl:k,c:'var(--t2)',d:tally[k]});
+  });
+  return rows;
+}
+
+function renderPaySummary(scr,txs){
+  const tally=tallyByMethod(txs);
+  const rows=methodRows(tally);
+
+  const grid=document.createElement('div');grid.className='paysum';
+  rows.forEach(function(r){
+    const cell=document.createElement('div');
+    cell.className='paycell'+(r.credit?' credit':'');
+    const l=document.createElement('div');l.className='paycell-l';
+    l.style.color=r.c;l.textContent=r.lbl;
+    const v=document.createElement('div');v.className='paycell-v';
+    v.textContent=fmt(r.d.total);
+    const nn=document.createElement('div');nn.className='paycell-n';
+    nn.textContent=r.d.count+(r.d.count===1?' sale':' sales');
+    cell.appendChild(l);cell.appendChild(v);cell.appendChild(nn);
+    grid.appendChild(cell);
+  });
+  scr.appendChild(grid);
+
+  // Spell out what the collected figure does and does not include.
+  const credit=tally['Utang']?tally['Utang'].total:0;
+  const collected=rows.reduce(function(a,r){return a+(r.credit?0:r.d.total);},0);
+  const note=document.createElement('div');note.className='paysum-note';
+  note.textContent=credit>0
+    ? 'Collected '+fmt(collected)+' \u00b7 a further '+fmt(credit)+' is on credit and still owed.'
+    : 'Collected '+fmt(collected)+' across '+rows.reduce(function(a,r){return a+r.d.count;},0)+' sales. Voided sales are excluded.';
+  scr.appendChild(note);
+}
+
+// Compact one-line version used under each day heading.
+function dayPayLine(txs){
+  const tally=tallyByMethod(txs);
+  const rows=methodRows(tally).filter(function(r){return r.d.count>0;});
+  if(!rows.length)return null;
+  const wrap=document.createElement('div');wrap.className='day-pay';
+  rows.forEach(function(r){
+    const s=document.createElement('span');
+    s.textContent=r.lbl+' ';
+    const b=document.createElement('b');b.style.color=r.c;b.textContent=fmt(r.d.total);
+    s.appendChild(b);
+    wrap.appendChild(s);
+  });
+  return wrap;
+}
+
 function renderHist(scr){
   const filt=S.sales.filter(s=>{
     const d=new Date(s.date);
@@ -3380,6 +3736,8 @@ function renderHist(scr){
   });
   scr.appendChild(bar);
 
+  renderPaySummary(scr,filt);
+
   const byDay={};
   filt.slice().reverse().forEach(s=>{const k=new Date(s.date).toDateString();if(!byDay[k])byDay[k]=[];byDay[k].push(s);});
 
@@ -3391,6 +3749,8 @@ function renderHist(scr){
     const dayTot=txs.reduce((a,s)=>a+s.total,0);
     const dl=document.createElement('div');dl.className='day-lbl';dl.textContent=lbl;list.appendChild(dl);
     const ds2=document.createElement('div');ds2.className='day-sub';ds2.textContent=txs.length+' transaction'+(txs.length!==1?'s':'')+' - '+fmt(dayTot);list.appendChild(ds2);
+    const dayPay=dayPayLine(txs);
+    if(dayPay)list.appendChild(dayPay);
     txs.forEach(s=>{
       const card=document.createElement('div');card.className='txcard'+(s.voided?' voided':'');
       card.innerHTML='<div class="txl"><div class="txid">'+s.id+(s.cashier?' · '+s.cashier:'')+'</div><div class="txitems">'+s.items.map(i=>i.name+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+(s.voided?'Voided':s.method)+'">'+(s.voided?'VOID':s.method)+'</div></div>';
@@ -3478,13 +3838,14 @@ function renderLock(scr,opts){
   setTimeout(function(){try{inp.focus();}catch(e){}},60);
 }
 
-function renderStockLock(scr,which){
+/* Guards the Inventory tab only. Preparation is left open so kitchen and
+   counter staff can adjust ingredient stock during service without an
+   admin present; prices and product records stay behind the password. */
+function renderStockLock(scr){
   renderLock(scr,{
-    badge:which==='prep'?'PREP':'STOCK',
-    title:which==='prep'?'Preparation locked':'Inventory locked',
-    sub:which==='prep'
-      ?'Enter the admin password to manage ingredients and recipes.'
-      :'Enter the admin password to view and edit stock.',
+    badge:'STOCK',
+    title:'Inventory locked',
+    sub:'Enter the admin password to view and edit stock.',
     onUnlock:function(){S.stockLocked=false;render();}
   });
 }
@@ -3557,8 +3918,9 @@ function renderAdmin(scr){
     logSync('Pulling latest data from cloud...');
     await loadCloudData(true);
     logSync('Done! '+S.prods.length+' products synced.',true);
-    render();
-    // Re-attach log since render() wiped the DOM
+    // No render() here — it rebuilds the whole screen and would wipe the log
+    // the user is still reading. Other tabs pick up the pulled data when
+    // they are next opened.
     toast('Sync complete — '+S.prods.length+' products pushed');
     syncBtn.textContent='Sync now';syncBtn.style.opacity='1';
   };
@@ -3877,6 +4239,88 @@ function renderAbout(scr){
     +'<div class="divl"></div>'
     +'<p style="font-size:13px;color:var(--t3);line-height:1.7">For customization or support, contact via phone or email.</p>';
   body.appendChild(creatorCard);
+
+  // ── Sync card ──
+  const syncCard=document.createElement('div');syncCard.className='about-card';
+  syncCard.style.cssText='gap:10px;width:100%;max-width:380px';
+
+  const syncTitle=document.createElement('div');
+  syncTitle.style.cssText='font-size:16px;font-weight:700;width:100%';
+  syncTitle.textContent='Sync to Dashboard';
+  syncCard.appendChild(syncTitle);
+
+  const syncSub=document.createElement('div');
+  syncSub.style.cssText='font-size:12px;color:var(--t3);width:100%;line-height:1.7';
+  syncSub.textContent='Sends every sale, void, expense, product, ingredient and setting on this device up to the Dashboard, then pulls back anything newer. Safe to run as often as you like.';
+  syncCard.appendChild(syncSub);
+
+  // What is waiting, so the button is not a leap of faith.
+  const pendRow=document.createElement('div');
+  pendRow.style.cssText='width:100%;font-size:12px;display:flex;flex-direction:column;gap:4px';
+  const queued=queueCount(), unsyncedPrep=unsyncedPrepCount();
+  const pendBits=[];
+  if(queued>0)pendBits.push(queued+' item'+(queued===1?'':'s')+' queued offline');
+  if(unsyncedPrep>0)pendBits.push(unsyncedPrep+' ingredient/recipe entr'+(unsyncedPrep===1?'y':'ies')+' not yet sent');
+  const pendLine=document.createElement('div');
+  if(!CLOUD.token){
+    pendLine.style.color='var(--wt)';
+    pendLine.textContent='Not signed in to the cloud — sign in from Admin first.';
+  } else if(!navigator.onLine){
+    pendLine.style.color='var(--wt)';
+    pendLine.textContent='Offline. Your work is saved here and will go up once you reconnect.';
+  } else if(pendBits.length){
+    pendLine.style.color='var(--wt)';
+    pendLine.textContent='Waiting to send: '+pendBits.join(' · ');
+  } else {
+    pendLine.style.color='var(--t3)';
+    pendLine.textContent='Holding '+S.sales.length+' sale'+(S.sales.length===1?'':'s')+', '
+      +S.prods.length+' product'+(S.prods.length===1?'':'s')+' and '
+      +S.ings.length+' ingredient'+(S.ings.length===1?'':'s')+' on this device.';
+  }
+  pendRow.appendChild(pendLine);
+  syncCard.appendChild(pendRow);
+
+  const syncLogBox=document.createElement('div');syncLogBox.id='fullSyncLog';
+  syncLogBox.style.cssText='width:100%;font-size:11px;font-family:monospace;background:var(--bg0);border:1px solid var(--b2);border-radius:8px;padding:10px 12px;line-height:2;color:var(--t2);display:none;max-height:300px;overflow-y:auto;text-align:left';
+  syncLogBox.setAttribute('role','log');
+  syncLogBox.setAttribute('aria-live','polite');
+
+  const fullSyncBtn=document.createElement('button');
+  fullSyncBtn.className='abtn pri';
+  fullSyncBtn.style.cssText='width:100%;padding:13px;font-size:14px;font-weight:700';
+  fullSyncBtn.textContent='Sync everything now';
+  fullSyncBtn.onclick=async function(){
+    if(fullSyncBtn.disabled)return;                 // guard against a double tap
+    fullSyncBtn.disabled=true;
+    fullSyncBtn.style.opacity='0.6';
+    fullSyncBtn.textContent='Syncing...';
+    syncLogBox.innerHTML='';syncLogBox.style.display='block';
+
+    const log=function(msg,ok){
+      const d=document.createElement('div');
+      d.style.color=ok===true?'var(--st)':ok===false?'var(--dt)':ok==='warn'?'var(--wt)':'var(--t2)';
+      d.textContent=(ok===true?'\u2713 ':ok===false?'\u2717 ':ok==='warn'?'\u26a0 ':'\u2192 ')+msg;
+      syncLogBox.appendChild(d);
+      syncLogBox.scrollTop=syncLogBox.scrollHeight;
+    };
+
+    let res={ok:false};
+    try{
+      res=await syncEverything(log);
+    }catch(e){
+      log('Sync stopped unexpectedly: '+(e&&e.message?e.message:e),false);
+    }
+
+    fullSyncBtn.disabled=false;
+    fullSyncBtn.style.opacity='1';
+    fullSyncBtn.textContent='Sync everything now';
+    toast(res.ok?'Sync complete':'Sync finished with problems — see the log');
+    // Deliberately no render() here: it would wipe the log the user is reading.
+  };
+
+  syncCard.appendChild(fullSyncBtn);
+  syncCard.appendChild(syncLogBox);
+  body.appendChild(syncCard);
 
   // ── Diagnostics card ──
   const diagCard=document.createElement('div');diagCard.className='about-card';
