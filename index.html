@@ -1725,7 +1725,13 @@ async function loadCloudData(silent){
       /* salePayload sends queue_no / queue_status / queue_day up, but nothing
          read them back, so every full sync silently stripped the queue
          numbers off this device's sales. */
-      S.sales=sales.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||'',queueNo:s.queue_no||0,queueStatus:s.queue_status||'',queueDay:s.queue_day||null}));
+      /* The cloud has no `receipt` column, so a pull would blank the receipt
+         text for sales this device took. Keep whatever is already held
+         locally for the same txn_id. The breakdown no longer depends on it,
+         but the original slip is still worth not throwing away. */
+      const oldReceipts={};
+      (S.sales||[]).forEach(function(o){if(o&&o.id&&o.receipt)oldReceipts[o.id]=o.receipt;});
+      S.sales=sales.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||oldReceipts[s.txn_id]||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||'',queueNo:s.queue_no||0,queueStatus:s.queue_status||'',queueDay:s.queue_day||null}));
       S.salesTotal=S.sales.filter(s=>!s.voided).reduce((a,s)=>a+s.total,0);
     }
     if(Array.isArray(expenses)){S.expenses=expenses.map(e=>({id:e.id,name:e.name,amount:e.amount,cat:e.cat,date:e.date}));}
@@ -5660,12 +5666,97 @@ function renderModal(app){
     body.appendChild(btns);
 
   } else if(m.type==='viewtx'){
-    body.innerHTML='<div class="mtitle">'+m.tx.id+(m.tx.voided?'<span style="font-size:12px;color:var(--dt);margin-left:8px;font-weight:400">VOIDED</span>':'')+'</div>';
-    if(m.tx.cashier){const cs=document.createElement('div');cs.style.cssText='font-size:12px;color:var(--t3)';cs.textContent='Cashier: '+m.tx.cashier;body.appendChild(cs);}
-    if(m.tx.voided&&m.tx.voidedBy){const vbi=document.createElement('div');vbi.style.cssText='font-size:12px;color:var(--dt)';vbi.textContent='Voided by: '+m.tx.voidedBy+(m.tx.voidedAt?' \u00b7 '+new Date(m.tx.voidedAt).toLocaleString():'');body.appendChild(vbi);}
-    const rb=document.createElement('div');rb.className='rbox';rb.textContent=m.tx.receipt;body.appendChild(rb);
+    /* The breakdown used to be nothing but `rb.textContent=m.tx.receipt` — the
+       pre-rendered receipt string. That string is produced at checkout and
+       held only on the till: salePayload() never sent a `receipt` column, so
+       the cloud copy has none, and loadCloudData() replaces S.sales wholesale
+       with the cloud copy. The upshot was that any sync — or opening the till
+       on a second device — blanked the breakdown for every past transaction.
+
+       It is now rebuilt from tx.items, which IS synced, so the breakdown
+       survives a sync and works on any device. The original receipt text is
+       still shown underneath when the device happens to have it. */
+    const tx=m.tx;
+    body.innerHTML='<div class="mtitle">'+esc(tx.id)
+      +(tx.voided?'<span style="font-size:12px;color:var(--dt);margin-left:8px;font-weight:400">VOIDED</span>':'')+'</div>';
+
+    // Header facts: when, who, how paid, reference.
+    const meta=document.createElement('div');
+    meta.style.cssText='font-size:12px;color:var(--t3);line-height:1.7;margin-bottom:10px';
+    const bits=[new Date(tx.date).toLocaleString('en-PH',{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})];
+    if(tx.cashier)bits.push('Cashier: '+tx.cashier);
+    bits.push('Paid by '+(tx.method||'Cash'));
+    if(tx.ref)bits.push('Ref: '+tx.ref);
+    if(tx.customer)bits.push('Customer: '+tx.customer);
+    if(tx.queueNo)bits.push('Queue #'+tx.queueNo);
+    meta.textContent=bits.join(' · ');
+    body.appendChild(meta);
+
+    if(tx.voided&&tx.voidedBy){
+      const vbi=document.createElement('div');
+      vbi.style.cssText='font-size:12px;color:var(--dt);margin:-6px 0 10px';
+      vbi.textContent='Voided by: '+tx.voidedBy+(tx.voidedAt?' \u00b7 '+new Date(tx.voidedAt).toLocaleString():'');
+      body.appendChild(vbi);
+    }
+
+    // Itemised lines with qty, unit price and line total.
+    const items=Array.isArray(tx.items)?tx.items:[];
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px';
+    const bh=document.createElement('div');
+    bh.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;display:flex;justify-content:space-between';
+    bh.innerHTML='<span>Items</span><span style="display:grid;grid-template-columns:34px 84px;gap:4px;text-align:center"><span>Qty</span><span style="text-align:right">Total</span></span>';
+    box.appendChild(bh);
+
+    if(!items.length){
+      const em=document.createElement('div');
+      em.style.cssText='font-size:12.5px;color:var(--t3);padding:6px 0';
+      em.textContent='This transaction has no item detail stored.';
+      box.appendChild(em);
+    }
+    let lineSum=0,qtySum=0;
+    items.forEach(function(it){
+      const q=+it.qty||0,pr=+it.price||0,lt=pr*q;
+      lineSum+=lt;qtySum+=q;
+      const row=document.createElement('div');
+      row.style.cssText='display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;border-bottom:1px solid var(--b1);font-size:13px';
+      const nm=esc(it.name)+(it.variantLabel?' <span style="color:var(--t3);font-size:11.5px">('+esc(it.variantLabel)+')</span>':'');
+      const sub='<span style="color:var(--t3);font-size:11px;display:block">'+fmt(pr)+' each'
+        +(it.cat?' · '+esc(it.cat):'')+(it.note?' · '+esc(it.note):'')+'</span>';
+      row.innerHTML='<span style="flex:1;min-width:0;color:var(--t1);font-weight:600">'+nm+sub+'</span>'
+        +'<span style="display:grid;grid-template-columns:34px 84px;gap:4px;flex-shrink:0">'
+        +'<span style="color:var(--t2);font-weight:700;text-align:center">'+q+'</span>'
+        +'<span style="color:var(--t1);font-weight:700;text-align:right">'+fmt(lt)+'</span></span>';
+      box.appendChild(row);
+    });
+
+    if(items.length){
+      box.appendChild(drawerRow('Subtotal ('+qtySum+' item'+(qtySum===1?'':'s')+')',fmt(lineSum),{rule:true}));
+      const disc=+tx.disc||0;
+      if(disc>0)box.appendChild(drawerRow('Discount','-'+fmt(disc),{color:'var(--wt)'}));
+      box.appendChild(drawerRow('Total',fmt(tx.total),{big:true,rule:true,color:tx.voided?'var(--t3)':'var(--ac)'}));
+      /* If the lines do not add up to the recorded total, say so rather than
+         showing two numbers that quietly disagree. */
+      const drift=Math.round((lineSum-disc-(+tx.total||0))*100)/100;
+      if(Math.abs(drift)>=0.01){
+        const w=document.createElement('div');
+        w.style.cssText='font-size:11px;color:var(--wt);padding-top:7px;line-height:1.5';
+        w.textContent='Item lines add up to '+fmt(lineSum-disc)+', which is '+fmt(Math.abs(drift))
+          +(drift>0?' more':' less')+' than the recorded total. The recorded total is what was taken.';
+        box.appendChild(w);
+      }
+    }
+    body.appendChild(box);
+
+    // The original receipt text, when this device still has it.
+    if(tx.receipt&&String(tx.receipt).trim()){
+      const rb=document.createElement('div');rb.className='rbox';
+      rb.style.marginTop='10px';rb.textContent=tx.receipt;
+      body.appendChild(rb);
+    }
+
     const b=document.createElement('div');b.className='mbtns';
-    if(!m.tx.voided){
+    if(!tx.voided){
       const vb=document.createElement('button');vb.className='mvoid';vb.textContent='Void/Refund';
       vb.onclick=function(){
         // Voids restore stock and reduce revenue — require admin password
@@ -5673,23 +5764,23 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
           function(pw){
         if(pw===null)return;
         if(pw!==S.pass){toast('Incorrect admin password — void cancelled');return;}
-        const tx=S.sales.find(s=>s.id===m.tx.id);
-        if(tx){
-          tx.voided=true;
-          tx.voidedBy=S.activeCashier?S.activeCashier.name:'Admin';
-          tx.voidedAt=new Date().toISOString();
-          S.salesTotal=Math.max(0,S.salesTotal-tx.total);
-          tx.items.forEach(it=>{applyStockDelta(it,it.qty);});
+        const tx2=S.sales.find(s=>s.id===m.tx.id);
+        if(tx2){
+          tx2.voided=true;
+          tx2.voidedBy=S.activeCashier?S.activeCashier.name:'Admin';
+          tx2.voidedAt=new Date().toISOString();
+          S.salesTotal=Math.max(0,S.salesTotal-tx2.total);
+          tx2.items.forEach(it=>{applyStockDelta(it,it.qty);});
           // Put the recipe ingredients back too, or a voided sale would
           // permanently lose the stock it consumed.
-          consumeIngredients(tx.items,1);
+          consumeIngredients(tx2.items,1);
           // And send the restored product stock up, or the Dashboard keeps
           // showing the reduced figure from the original sale.
-          pushProductStock(tx.items);
+          pushProductStock(tx2.items);
         }
         save();
         // Sync void to cloud — queues if offline
-        syncVoidToCloud(m.tx.id,tx?tx.voidedBy:'',tx?tx.voidedAt:'');
+        syncVoidToCloud(m.tx.id,tx2?tx2.voidedBy:'',tx2?tx2.voidedAt:'');
         closeModal();toast('Transaction voided');
       },{title:'Void transaction '+m.tx.id,password:true,tone:'dang',
              okText:'Void sale',placeholder:'Admin password',required:true,
@@ -5701,7 +5792,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const printBtn2=document.createElement('button');printBtn2.className='mpri';
     printBtn2.style.cssText='padding:10px 16px;font-size:13px;font-weight:700;display:flex;align-items:center;gap:6px';
     printBtn2.innerHTML='🖨️ Print';
-    printBtn2.onclick=function(){printReceipt(m.tx);};
+    printBtn2.onclick=function(){printReceipt(tx);};
     b.appendChild(printBtn2);
     const cb=document.createElement('button');cb.textContent='Close';cb.onclick=closeModal;b.appendChild(cb);body.appendChild(b);
 
