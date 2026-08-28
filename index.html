@@ -3420,10 +3420,27 @@ function renderCashierLogin(app){
 /* Sales taken on a given local day, ignoring voided ones. Used so the
    Expenses tab can show net profit for whichever day is selected rather than
    always comparing against today's takings. */
+/* A day's takings split by tender. Needed because only Cash actually puts
+   notes in the till — GCash and credit are revenue but never cash on hand, so
+   a cash figure that included them would never reconcile against the drawer. */
+function salesOnDayBreakdown(key){
+  const out={cash:0,gcash:0,credit:0,other:0,total:0,count:0};
+  (S.sales||[]).forEach(function(s){
+    if(s.voided)return;
+    if(dayKey(s.date)!==key)return;
+    const amt=+s.total||0;
+    out.total+=amt;out.count++;
+    const m=s.method||'Cash';
+    if(m==='Cash')out.cash+=amt;
+    else if(m==='GCash')out.gcash+=amt;
+    else if(m==='Utang')out.credit+=amt;
+    else out.other+=amt;
+  });
+  return out;
+}
+
 function salesOnDay(key){
-  return (S.sales||[]).filter(function(s){
-    return !s.voided&&dayKey(s.date)===key;
-  }).reduce(function(a,s){return a+(+s.total||0);},0);
+  return salesOnDayBreakdown(key).total;
 }
 
 function renderExp(scr){
@@ -3439,19 +3456,49 @@ function renderExp(scr){
   const selKey=S.expDate||dayKey(new Date());
   const isToday=selKey===dayKey(new Date());
   const dayExpAmt=S.expenses.filter(function(e){return dayKey(e.date)===selKey;}).reduce(function(a,e){return a+(+e.amount||0);},0);
-  const daySalesAmt=salesOnDay(selKey);
+  const bdown=salesOnDayBreakdown(selKey);
+  const daySalesAmt=bdown.total;
   const dayNet=daySalesAmt-dayExpAmt;
+  /* Cash on hand is cash takings less what was paid out — GCash and credit are
+     deliberately left out. They are real revenue (so they belong in Net
+     profit) but no notes ever entered the till, so counting them here would
+     make the figure impossible to match against a physical count. */
+  const cashOnHand=bdown.cash-dayExpAmt;
   const statLbl=isToday?'Today':new Date(selKey+'T00:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'});
 
   const stats=document.createElement('div');stats.className='stats';
-  [{l:statLbl+' sales',v:fmt(daySalesAmt),c:'color:var(--st)'},
-   {l:statLbl+' expenses',v:fmt(dayExpAmt),c:'color:var(--wt)'},
-   {l:'Net profit',v:fmt(dayNet),c:dayNet>=0?'color:var(--st)':'color:var(--dt)'}].forEach(function(s){
+  const statRows=[
+    {l:statLbl+' sales',v:fmt(daySalesAmt),c:'color:var(--st)'},
+    {l:statLbl+' expenses',v:fmt(dayExpAmt),c:'color:var(--wt)'},
+    {l:'Net profit',v:fmt(dayNet),c:dayNet>=0?'color:var(--st)':'color:var(--dt)'},
+    {l:'Cash sales',v:fmt(bdown.cash),c:'color:var(--st)'},
+    {l:'GCash',v:fmt(bdown.gcash),c:'color:var(--pt)'},
+    {l:'Cash on hand',v:fmt(cashOnHand),c:cashOnHand>=0?'color:var(--ac)':'color:var(--dt)'}
+  ];
+  // Credit only earns a tile on days it was actually used.
+  if(bdown.credit>0)statRows.push({l:'Credit (unpaid)',v:fmt(bdown.credit),c:'color:var(--wt)'});
+  if(bdown.other>0)statRows.push({l:'Other tender',v:fmt(bdown.other),c:'color:var(--t2)'});
+  statRows.forEach(function(s){
     const d=document.createElement('div');d.className='stat';
     d.innerHTML='<div class="stat-l">'+esc(s.l)+'</div><div class="stat-v" style="font-size:14px;'+s.c+'">'+s.v+'</div>';
     stats.appendChild(d);
   });
   scr.appendChild(stats);
+
+  /* Spells out the arithmetic, because "cash on hand" is otherwise easy to
+     read as "everything I took today minus expenses". */
+  const cohNote=document.createElement('div');
+  cohNote.style.cssText='margin:0 16px 4px;font-size:11.5px;color:var(--t3);line-height:1.6';
+  const excluded=[];
+  if(bdown.gcash>0)excluded.push('GCash '+fmt(bdown.gcash));
+  if(bdown.credit>0)excluded.push('credit '+fmt(bdown.credit));
+  if(bdown.other>0)excluded.push('other tender '+fmt(bdown.other));
+  cohNote.textContent='Cash on hand = cash sales '+fmt(bdown.cash)+' − expenses '+fmt(dayExpAmt)+'.'
+    +(excluded.length?' Excludes '+excluded.join(' and ')+' — no notes changed hands.':'')
+    +(S.openShift&&dayKey(S.openShift.startedAt)===selKey
+      ? ' Add the opening float of '+fmt(S.openShift.openingFloat||0)+' for the full drawer — see Attendance.'
+      : '');
+  scr.appendChild(cohNote);
 
   const bar=document.createElement('div');bar.className='hist-bar';
   [{id:'today',lbl:'Today'},{id:'week',lbl:'This week'},{id:'month',lbl:'This month'},{id:'all',lbl:'All time'}].forEach(function(f){
@@ -3512,10 +3559,18 @@ function renderExp(scr){
     list.appendChild(dh);
 
     const dsub=document.createElement('div');
-    dsub.style.cssText='font-size:11px;color:var(--t3);padding:0 2px 8px';
-    const daySales=salesOnDay(k);
-    dsub.textContent=rows.length+' entr'+(rows.length===1?'y':'ies')
-      +(daySales>0?' · sales '+fmt(daySales)+' · net '+fmt(daySales-dTot):'');
+    dsub.style.cssText='font-size:11px;color:var(--t3);padding:0 2px 8px;line-height:1.6';
+    const dayBd=salesOnDayBreakdown(k);
+    const parts=[rows.length+' entr'+(rows.length===1?'y':'ies')];
+    if(dayBd.total>0){
+      parts.push('sales '+fmt(dayBd.total));
+      parts.push('net '+fmt(dayBd.total-dTot));
+      // The cash line is what a drawer count for that day should come back to.
+      parts.push('cash on hand '+fmt(dayBd.cash-dTot));
+      if(dayBd.gcash>0)parts.push('GCash '+fmt(dayBd.gcash));
+      if(dayBd.credit>0)parts.push('credit '+fmt(dayBd.credit));
+    }
+    dsub.textContent=parts.join(' · ');
     list.appendChild(dsub);
 
     rows.forEach(function(e){
