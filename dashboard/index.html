@@ -296,28 +296,34 @@ function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className
 function fmt(n){return'PHP '+Number(n||0).toLocaleString('en-PH',{minimumFractionDigits:2,maximumFractionDigits:2});}
 function fd(d){return new Date(d).toLocaleDateString('en-PH',{month:'short',day:'numeric',year:'numeric'});}
 function ft(d){return new Date(d).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
-
-async function api(path,opts){
-  const authToken=(SESSION&&SESSION.token)?SESSION.token:SB_KEY;
-  const h={'apikey':SB_KEY,'Authorization':'Bearer '+authToken,'Content-Type':'application/json',...(opts&&opts.headers||{})};
-  try{
-    const r=await fetch(SB_URL+path,{...opts,headers:h});
-    if(!r.ok){
-      const errText=await r.text();
-      console.error('API error',r.status,errText);
-      return null;
-    }
-    if(r.status===204||r.status===205){return true;}
-    const t=await r.text();return t?JSON.parse(t):true;
-  }catch(e){console.error('API fetch error',e);return null;}
+/* cost_per_unit is the column this dashboard writes. Older POS builds wrote a
+   plain `cost` instead, so read either and never return undefined — an
+   undefined here turned every COGS and margin figure into NaN. */
+function ingCost(ing){
+  if(!ing)return 0;
+  const v=(ing.cost_per_unit!=null)?ing.cost_per_unit:ing.cost;
+  return Number(v)||0;
 }
+function ingLow(ing){
+  if(!ing)return 0;
+  const v=(ing.low_threshold!=null)?ing.low_threshold:ing.low;
+  return Number(v)||0;
+}
+
+/* api() lives further down, next to refreshDashSession(), because it needs
+   to retry on 401. There used to be a second, non-retrying copy right here;
+   because both were function declarations in the same scope the later one
+   hoisted over this one from the very first line, so this copy never ran and
+   any edit made to it was silently discarded. */
 async function signIn(email,pw){
   try{const r=await fetch(SB_URL+'/auth/v1/token?grant_type=password',{method:'POST',headers:{'apikey':SB_KEY,'Content-Type':'application/json'},body:JSON.stringify({email,password:pw})});return await r.json();}
   catch(e){return{error:{message:'Network error'}};}
 }
 async function signOut(){
   try{await fetch(SB_URL+'/auth/v1/logout',{method:'POST',headers:{'apikey':SB_KEY,'Authorization':'Bearer '+SESSION.token}});}catch(e){}
-  SESSION={token:null,user:null,bizId:null,bizName:'',email:''};
+  // Same shape as the initial literal — a partial reset left a stale refresh
+  // token and settings object hanging off SESSION after sign out.
+  SESSION={token:null,refresh:null,user:null,bizId:null,bizName:'',email:'',settings:{}};
   localStorage.removeItem('apos_dash');render();
 }
 function saveSession(){localStorage.setItem('apos_dash',JSON.stringify(SESSION));}
@@ -398,8 +404,11 @@ async function loadData(){
   UI.loading=false;
   await loadSettingsFromCloud();
   _loadDataBusy=false;
-  updateSyncStatus('idle','Synced '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
+  /* render() rebuilds the sidebar, and the fresh dashSyncLbl starts out
+     reading plain "Synced" — so the status has to be written after the
+     rebuild, not before it, or the timestamp is thrown away immediately. */
   render();
+  updateSyncStatus('idle','Synced '+new Date().toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}));
 }
 
 async function loadSettingsFromCloud(){
@@ -550,7 +559,11 @@ function renderAuth(root){
     btn.disabled=true;btn.textContent='Signing in...';
     const res=await signIn(email,pw);
     if(!res.access_token){document.getElementById('dErr').textContent=res.error&&res.error.message||'Sign in failed.';btn.disabled=false;btn.textContent='Sign in to dashboard';return;}
-    SESSION.token=res.access_token;SESSION.user=res.user&&res.user.id;SESSION.email=email;
+    // The refresh token MUST be stored — refreshDashSession() reads it, and
+    // without it every access token silently dies after ~1 hour and each
+    // later api() call 401s with no way back except a manual re-login.
+    SESSION.token=res.access_token;SESSION.refresh=res.refresh_token||null;
+    SESSION.user=res.user&&res.user.id;SESSION.email=email;SESSION.settings=SESSION.settings||{};
     // Smart biz finder on login
     const loginHeaders={'apikey':SB_KEY,'Authorization':'Bearer '+res.access_token,'Content-Type':'application/json'};
     // First check if POS is open in the same browser - use its bizId directly
@@ -580,7 +593,9 @@ function renderAuth(root){
       SESSION.bizId=correctBiz.id;SESSION.bizName=correctBiz.name;
     }
     console.log('[ArroyoDash] Login complete. bizId:',SESSION.bizId,'bizName:',SESSION.bizName);
-    saveSession();await loadData();
+    saveSession();
+    scheduleDashTokenRefresh();
+    await loadData();
   };
   pi.onkeydown=function(e){if(e.key==='Enter')btn.click();};
   card.appendChild(btn);page.appendChild(card);root.appendChild(page);
@@ -608,7 +623,12 @@ function renderApp(root){
   const mInfo=el('div','');
   mInfo.innerHTML='<div class="mobile-title">'+SESSION.bizName+'</div><div class="mobile-biz">'+UI.page.charAt(0).toUpperCase()+UI.page.slice(1)+'</div>';
   const mSync=el('button','add-btn','Sync');mSync.style.cssText='padding:6px 12px;font-size:11px';
-  mSync.onclick=async function(){mSync.textContent='...';await loadData();mSync.textContent='Sync';};
+  mSync.onclick=async function(){
+    mSync.textContent='...';updateSyncStatus('syncing');
+    const authed=await ensureDashAuth();
+    if(!authed){mSync.textContent='Sync';updateSyncStatus('error','Session expired');alert('Session expired. Please sign in again.');return;}
+    await loadData();
+  };
   mTop.appendChild(hamBtn);mTop.appendChild(mInfo);mTop.appendChild(mSync);
   app.appendChild(mTop);
   const sb=el('aside','sidebar');
@@ -642,7 +662,7 @@ function renderApp(root){
   navItem('pnl','ti-trending-up','Profit & Loss');
   navSection('Operations');
   navItem('inventory','ti-box','Inventory');
-  navItem('ingredients','ti-salad','Ingredients'+(D.ingredients.filter(function(i){return i.stock<=i.low_threshold;}).length>0?' ⚠':''));
+  navItem('ingredients','ti-salad','Ingredients'+(D.ingredients.filter(function(i){return i.stock<=ingLow(i);}).length>0?' ⚠':''));
   navItem('recipes','ti-book','Recipes');
   navItem('wastage','ti-trash','Wastage');
   navItem('orders','ti-shopping-cart','Orders');
@@ -663,9 +683,16 @@ function renderApp(root){
   const slbl=document.createElement('span');slbl.id='dashSyncLbl';
   slbl.style.cssText='font-size:10px;color:var(--t3);font-weight:600';
   slbl.textContent=offlineNow?'Offline':'Synced';
-  syncStatusRow.appendChild(sdot);syncStatusRow.appendChild(slbl);foot.appendChild(syncStatusRow);
-  foot.innerHTML+='<div class="user-email">'+SESSION.email+'</div><div style="font-size:10px;color:var(--t3);padding:2px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+SESSION.bizId+'">biz: '+(SESSION.bizId?SESSION.bizId.slice(0,8)+'...':'⚠ none')+'</div>';
-  foot.insertBefore(syncStatusRow,foot.firstChild);
+  syncStatusRow.appendChild(sdot);syncStatusRow.appendChild(slbl);
+  /* Build the rest of the footer as its own node. Writing foot.innerHTML+=
+     re-parses everything already inside foot, which replaced syncStatusRow
+     with a detached clone; re-inserting the original then left two rows in
+     the DOM sharing the ids dashSyncDot / dashSyncLbl, so updateSyncStatus
+     only ever repainted one of them. */
+  const footMeta=document.createElement('div');
+  footMeta.innerHTML='<div class="user-email">'+SESSION.email+'</div><div style="font-size:10px;color:var(--t3);padding:2px 8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+(SESSION.bizId||'')+'">biz: '+(SESSION.bizId?SESSION.bizId.slice(0,8)+'...':'⚠ none')+'</div>';
+  foot.appendChild(syncStatusRow);
+  while(footMeta.firstChild)foot.appendChild(footMeta.firstChild);
   const syncBtn=el('button','so-btn','<i class="ti ti-refresh" style="font-size:14px;vertical-align:-2px;margin-right:4px"></i>Sync data');
   syncBtn.onclick=async function(){
     syncBtn.textContent='Syncing...';updateSyncStatus('syncing');
@@ -692,9 +719,10 @@ function renderApp(root){
         if(r.ok){const d=await r.json();if(d&&d[0]){SESSION.bizId=d[0].id;SESSION.bizName=d[0].name;saveSession();console.log('[ArroyoDash] BizId fetched from Supabase:',SESSION.bizId);}}
       }catch(e){}
     }
+    /* loadData() re-renders, which replaces this button with a fresh one that
+       already reads "Sync data", and sets the status line itself. Touching
+       syncBtn afterwards would only write to a detached node. */
     await loadData();
-    syncBtn.innerHTML='<i class="ti ti-refresh" style="font-size:14px;vertical-align:-2px;margin-right:4px"></i>Sync data';
-    updateSyncStatus('idle','Synced');
   };
   foot.appendChild(syncBtn);
   const soBtn=el('button','so-btn','<i class="ti ti-logout" style="font-size:14px;vertical-align:-2px;margin-right:4px"></i>Sign out');
@@ -740,7 +768,7 @@ function calcCOGS(salesArr){
       const recipes=D.recipes.filter(function(r){return r.product_name===item.name;});
       recipes.forEach(function(r){
         const ing=D.ingredients.find(function(i){return i.id===r.ingredient_id;});
-        if(ing)cogs+=r.qty_used*(item.qty||1)*ing.cost_per_unit;
+        if(ing)cogs+=r.qty_used*(item.qty||1)*ingCost(ing);
       });
     });
   });
@@ -750,7 +778,7 @@ function calcCOGS(salesArr){
 function renderOverview(main,fs,fe,rev,exp,net){
   main.appendChild(el('div','page-title','Overview'));
   // Low stock alert banner
-  const lowItems=D.ingredients.filter(function(i){return i.stock<=i.low_threshold;});
+  const lowItems=D.ingredients.filter(function(i){return i.stock<=ingLow(i);});
   if(lowItems.length>0){
     const alert=el('div','');
     alert.style.cssText='background:var(--dg);border:1px solid var(--dt);border-radius:10px;padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px;cursor:pointer';
@@ -826,7 +854,16 @@ function renderOverview(main,fs,fe,rev,exp,net){
   const cw=el('div','chart-wrap');const cv=document.createElement('canvas');cv.id='sChart';cw.appendChild(cv);cc.appendChild(cw);main.appendChild(cc);
   const two=el('div','two-col');
   const pm=el('div','card');pm.innerHTML='<div class="card-hd">Payment methods</div>';
-  ['Cash','Card','GCash','Utang'].forEach(function(m){
+  /* Card was withdrawn as a tender option in the POS, so it is no longer a
+     fixed row. Any method actually present in the data is still listed —
+     including historic Card takings — so nothing drops out of the totals. */
+  const baseMethods=['Cash','GCash','Utang'];
+  const seenMethods=[];
+  fs.forEach(function(s){
+    const k=s.method||'Cash';
+    if(baseMethods.indexOf(k)===-1&&seenMethods.indexOf(k)===-1)seenMethods.push(k);
+  });
+  baseMethods.concat(seenMethods).forEach(function(m){
     const a=fs.filter(function(s){return s.method===m;}).reduce(function(a,s){return a+s.total;},0);
     const cnt=fs.filter(function(s){return s.method===m;}).length;
     const pct=rev>0?Math.round(a/rev*100):0;
@@ -1381,7 +1418,7 @@ function renderRecipes(main){
       let costPerServing=0;
       prodRecipes.forEach(function(r){
         const ing=D.ingredients.find(function(i){return i.id===r.ingredient_id;});
-        if(ing)costPerServing+=r.qty_used*ing.cost_per_unit;
+        if(ing)costPerServing+=r.qty_used*ingCost(ing);
       });
       const margin=p.price-costPerServing;
       const marginPct=p.price>0?Math.round(margin/p.price*100):0;
@@ -1417,8 +1454,8 @@ function renderIngredients(main){
   main.appendChild(el('div','page-title','Ingredients'));
 
   // Calculations
-  const totalCostValue=D.ingredients.reduce(function(a,i){return a+i.stock*i.cost_per_unit;},0);
-  const low=D.ingredients.filter(function(i){return i.stock<=i.low_threshold;}).length;
+  const totalCostValue=D.ingredients.reduce(function(a,i){return a+i.stock*ingCost(i);},0);
+  const low=D.ingredients.filter(function(i){return i.stock<=ingLow(i);}).length;
   const out=D.ingredients.filter(function(i){return i.stock<=0;}).length;
 
   // Daily consumption — based on last 7 days sales
@@ -1456,7 +1493,7 @@ function renderIngredients(main){
   const costRows=[
     ['Total ingredient value',fmt(totalCostValue),''],
     ['Average cost per ingredient',D.ingredients.length?fmt(totalCostValue/D.ingredients.length):'PHP 0.00',''],
-    ['Most expensive ingredient',(function(){const s=D.ingredients.slice().sort(function(a,b){return b.stock*b.cost_per_unit-a.stock*a.cost_per_unit;});return s[0]?s[0].name+' ('+fmt(s[0].stock*s[0].cost_per_unit)+')':'None';})(),''],
+    ['Most expensive ingredient',(function(){const s=D.ingredients.slice().sort(function(a,b){return b.stock*ingCost(b)-a.stock*ingCost(a);});return s[0]?s[0].name+' ('+fmt(s[0].stock*ingCost(s[0]))+')':'None';})(),''],
   ];
   costRows.forEach(function(row){
     const r=el('div','payslip-row');
@@ -1469,12 +1506,12 @@ function renderIngredients(main){
   const c=el('div','card');
   const hd=el('div','card-hd','Ingredient stock');hd.appendChild(addBtn('+ Add ingredient',function(){UI.modal={type:'ingredient',item:null};render();}));c.appendChild(hd);
   D.ingredients.sort(function(a,b){return a.stock-b.stock;}).forEach(function(ing){
-    const isLow=ing.stock<=ing.low_threshold;
+    const isLow=ing.stock<=ingLow(ing);
     const days=daysRemaining[ing.id];
     const dailyUse=dailyConsumption[ing.id]||0;
     const r=el('div','row');
     const rl=el('div','row-l');
-    let sub=ing.unit+' · PHP '+ing.cost_per_unit+'/unit · Value: '+fmt(ing.stock*ing.cost_per_unit);
+    let sub=ing.unit+' · PHP '+ingCost(ing)+'/unit · Value: '+fmt(ing.stock*ingCost(ing));
     if(dailyUse>0)sub+='<br><span style="color:'+(days&&days<=3?'var(--dt)':days&&days<=7?'var(--wt)':'var(--st)')+'">~'+dailyUse.toFixed(1)+ing.unit+'/day · '+(days!==null?days+' days left':'unlimited')+'</span>';
     else sub+='<br><span style="color:var(--t3)">No sales data yet</span>';
     rl.innerHTML='<div class="row-name">'+ing.name+'</div><div class="row-sub" style="line-height:1.6">'+sub+'</div>';
@@ -1639,7 +1676,7 @@ function renderPnL(main,fs,fe,rev,exp,net){
     let cogs2=0;
     recipes.forEach(function(r){
       const ing=D.ingredients.find(function(i){return i.id===r.ingredient_id;});
-      if(ing)cogs2+=r.qty_used*ing.cost_per_unit;
+      if(ing)cogs2+=r.qty_used*ingCost(ing);
     });
     const sold=fs.filter(function(s){return!s.voided;}).reduce(function(a,s){
       return a+(s.items||[]).filter(function(i){return i.name===p.name;}).reduce(function(b,i){return b+(i.qty||1);},0);
@@ -1733,7 +1770,14 @@ function renderModal(root){
       const p={biz_id:SESSION.bizId,name:gv('eName'),role:gv('eRole')||'Staff',phone:gv('ePhone'),pay_type:pt,rate:pt==='commission'?0:rate,commission_pct:pt==='commission'?rate:0,active:true};
       if(!p.name){alert('Enter name');return;}
       save('employees',p,it.id);
-    },isNew?'Add':'Save',it.id?function(){uiConfirm('Remove '+it.name+'?',function(__ok){if(!__ok)return;api('/rest/v1/employees?id=eq.'+it.id,{method:'PATCH',body:JSON.stringify({active:false})}).then(loadData);},{tone:'dang'});close();}:null);
+    /* close() used to sit outside the uiConfirm callback, so the edit modal
+       vanished before the user had answered — and it vanished whether they
+       confirmed or cancelled. */
+    },isNew?'Add':'Save',it.id?function(){uiConfirm('Remove '+it.name+'?',async function(__ok){
+      if(!__ok){close();return;}
+      await api('/rest/v1/employees?id=eq.'+it.id,{method:'PATCH',headers:{'Prefer':'return=representation'},body:JSON.stringify({active:false})});
+      UI.modal=null;await loadData();
+    },{tone:'dang'});}:null);
 
   } else if(m.type==='empAtt'){
     const e=m.item;
@@ -1934,6 +1978,13 @@ function renderModal(root){
         // PATCH only the fields the user can edit here.
         // Preserve variants, img, and sale_pct that come from the POS — do not overwrite them.
         const patch={name:nm,price:pr,cat:ct,stock:stk,icon:ic};
+        /* The POS matches cloud products on local_id. A row with a null
+           local_id is invisible to that match, so the POS treats its own copy
+           as new and posts a duplicate. Backfill one here. */
+        if(it.local_id==null){
+          const maxId=D.products.reduce(function(mx,p){return Math.max(mx,p.local_id||0);},0);
+          patch.local_id=maxId+1;
+        }
         const r=await api('/rest/v1/products?id=eq.'+it.id,{method:'PATCH',headers:{'Prefer':'return=representation'},body:JSON.stringify(patch)});
         if(r===null){alert('Save failed. Check connection.');return;}
       }
@@ -2054,8 +2105,8 @@ function renderModal(root){
     box.appendChild(calcCard);
 
     mfField(box,'iStock','Current stock (in your unit)','number',it.stock,'0');
-    mfField(box,'iThresh','Low stock alert at','number',it.low_threshold||5,'5');
-    mfField(box,'iCost','Cost per unit (PHP)','number',it.cost_per_unit,'0');
+    mfField(box,'iThresh','Low stock alert at','number',ingLow(it)||5,'5');
+    mfField(box,'iCost','Cost per unit (PHP)','number',ingCost(it),'0');
 
     modalBtns(box,close,async function(){
       const name=gv('iName');
@@ -2162,8 +2213,8 @@ function scheduleDashTokenRefresh(){
   }catch(e){}
 }
 
-// Override api() to auto-retry on 401 with token refresh
-const _origApi=api;
+/* The single api() for the whole dashboard. Retries once on 401/403 after a
+   token refresh, so an expired session recovers without a re-login. */
 async function api(path,opts){
   const authToken=(SESSION&&SESSION.token)?SESSION.token:SB_KEY;
   const h={'apikey':SB_KEY,'Authorization':'Bearer '+authToken,'Content-Type':'application/json',...(opts&&opts.headers||{})};
