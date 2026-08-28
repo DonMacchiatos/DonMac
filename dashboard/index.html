@@ -288,7 +288,7 @@ if(typeof DASH_PREFILL!=='undefined'){
     document.head.appendChild(m);
   }
 })();
-let D={sales:[],expenses:[],products:[],employees:[],attendance:[],customers:[],credit:[],suppliers:[],pos:[],ingredients:[],recipes:[],wastage:[],orders:[],loans:[],leaves:[]};
+let D={sales:[],expenses:[],products:[],employees:[],attendance:[],customers:[],credit:[],suppliers:[],pos:[],ingredients:[],recipes:[],wastage:[],orders:[],loans:[],leaves:[],shifts:[]};
 let UI={page:'overview',filter:'week',modal:null,loading:false};
 let CHARTS={};
 
@@ -397,8 +397,9 @@ async function loadData(){
     api('/rest/v1/orders?biz_id=eq.'+bid+'&order=created_at.desc&limit=200'),
     api('/rest/v1/employee_loans?biz_id=eq.'+bid+'&order=date.desc'),
     api('/rest/v1/leaves?biz_id=eq.'+bid+'&order=created_at.desc'),
+    api('/rest/v1/shifts?biz_id=eq.'+bid+'&order=started_at.desc&limit=300'),
   ]);
-  const keys=['sales','expenses','products','employees','attendance','customers','credit','suppliers','pos','ingredients','recipes','wastage','orders','loans','leaves'];
+  const keys=['sales','expenses','products','employees','attendance','customers','credit','suppliers','pos','ingredients','recipes','wastage','orders','loans','leaves','shifts'];
   keys.forEach(function(k,i){D[k]=Array.isArray(results[i])?results[i]:[];});
   console.log('[ArroyoDash] Data loaded - sales:',D.sales.length,'expenses:',D.expenses.length,'products:',D.products.length);
   UI.loading=false;
@@ -668,6 +669,7 @@ function renderApp(root){
   navItem('orders','ti-shopping-cart','Orders');
   navSection('Finance');
   navItem('expenses','ti-wallet','Expenses');
+  navItem('shifts','ti-cash','Cash drawer'+(D.shifts.filter(function(x){return (+x.variance||0)<-0.005||x.counted_cash===null;}).length>0?' ⚠':''));
   navItem('suppliers','ti-truck','Suppliers');
   navSection('People');
   navItem('employees','ti-users','Employees');
@@ -748,6 +750,7 @@ function renderApp(root){
   else if(UI.page==='wastage'){renderWastage(main,rev);}
   else if(UI.page==='reports'){renderReports(main,fs,rev,exp,net);}
   else if(UI.page==='pnl'){renderPnL(main,fs,fe,rev,exp,net);}
+  else if(UI.page==='shifts'){renderShifts(main);}
   app.appendChild(main);
   // Bottom navigation for mobile
   const bnav=el('div','bottom-nav');
@@ -1360,6 +1363,159 @@ function renderSuppliers(main){
   });
   if(!D.pos.length)poc.appendChild(el('div','empty','No purchase orders'));
   two.appendChild(poc);main.appendChild(two);
+}
+
+/* ==================================================================== *
+ * CASH DRAWER
+ *
+ * Reads the `shifts` table the POS writes on check-out. Negative variance is
+ * short, positive is over, and a NULL counted_cash means the drawer was never
+ * counted at all — which is reported as its own state rather than being
+ * folded in as a zero, because "nobody counted" and "counted and balanced"
+ * are very different facts about a shift.
+ * ==================================================================== */
+function dashEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
+function renderShifts(main){
+  main.appendChild(el('div','page-title','Cash drawer'));
+
+  const all=(D.shifts||[]).slice();
+  if(!all.length){
+    const c0=el('div','card');
+    c0.innerHTML='<div class="card-hd">Shifts</div>';
+    c0.appendChild(el('div','empty','No shifts recorded yet. A shift appears here once a cashier checks out and counts the drawer in the POS.'));
+    main.appendChild(c0);
+    return;
+  }
+
+  const counted=all.filter(function(x){return x.counted_cash!==null&&x.counted_cash!==undefined;});
+  const uncounted=all.filter(function(x){return x.counted_cash===null||x.counted_cash===undefined;});
+  const shortOnes=counted.filter(function(x){return (+x.variance||0)<-0.005;});
+  const overOnes=counted.filter(function(x){return (+x.variance||0)>0.005;});
+  const netVar=counted.reduce(function(a,x){return a+(+x.variance||0);},0);
+  const absVar=counted.reduce(function(a,x){return a+Math.abs(+x.variance||0);},0);
+
+  const sg=el('div','stats-grid');
+  sg.appendChild(statCard('Shifts',all.length,counted.length+' counted',''));
+  sg.appendChild(statCard('Times short',shortOnes.length,'',shortOnes.length?'red':'green'));
+  sg.appendChild(statCard('Times over',overOnes.length,'',overOnes.length?'amber':'green'));
+  /* Net is what the till is actually out by overall; total discrepancy is the
+     sum of the absolute gaps, which is the number that matters for spotting a
+     cashier whose shorts and overs cancel out on paper. */
+  sg.appendChild(statCard('Net variance',fmt(netVar),'across counted shifts',Math.abs(netVar)<0.005?'green':(netVar<0?'red':'amber')));
+  sg.appendChild(statCard('Total discrepancy',fmt(absVar),'shorts + overs',absVar>0?'amber':'green'));
+  sg.appendChild(statCard('Never counted',uncounted.length,'no cash count',uncounted.length?'red':'green'));
+  main.appendChild(sg);
+
+  if(uncounted.length){
+    const warn=el('div','card');
+    warn.innerHTML='<div class="card-hd">Drawers that were never counted <span>'+uncounted.length+'</span></div>';
+    const w=el('div','');
+    w.style.cssText='font-size:13px;color:var(--t3);line-height:1.6;margin-bottom:8px';
+    w.textContent='These shifts closed without a cash count, so no short or over can be worked out for them. Usually it means the cashier was removed or deactivated mid-shift.';
+    warn.appendChild(w);
+    uncounted.slice(0,10).forEach(function(x){
+      const r=el('div','row');
+      r.innerHTML='<div class="row-l"><div class="row-name">'+dashEsc(x.cashier||'—')+'</div>'
+        +'<div class="row-sub">'+fd(x.started_at)+' · float '+fmt(x.opening_float)+'</div></div>'
+        +'<div class="row-r"><span class="badge b-gray">Not counted</span></div>';
+      warn.appendChild(r);
+    });
+    main.appendChild(warn);
+  }
+
+  // Per-cashier roll-up, worst total discrepancy first.
+  const byCashier={};
+  counted.forEach(function(x){
+    const k=x.cashier||'—';
+    if(!byCashier[k])byCashier[k]={shifts:0,short:0,over:0,net:0,abs:0,sales:0};
+    const b=byCashier[k];
+    b.shifts++;b.net+=(+x.variance||0);b.abs+=Math.abs(+x.variance||0);
+    b.sales+=(+x.cash_sales||0);
+    if((+x.variance||0)<-0.005)b.short++;
+    else if((+x.variance||0)>0.005)b.over++;
+  });
+  const cashierRows=Object.keys(byCashier).map(function(k){return[k,byCashier[k]];})
+    .sort(function(a,b){return b[1].abs-a[1].abs;});
+
+  if(cashierRows.length){
+    const cc=el('div','card');
+    cc.innerHTML='<div class="card-hd">By cashier <span>counted shifts only</span></div>';
+    const tbl=el('table','tbl','<thead><tr><th>Cashier</th><th style="text-align:right">Shifts</th>'
+      +'<th style="text-align:right">Short</th><th style="text-align:right">Over</th>'
+      +'<th style="text-align:right">Net</th><th style="text-align:right">Discrepancy</th></tr></thead>');
+    const tb=document.createElement('tbody');
+    cashierRows.forEach(function(e){
+      const k=e[0],b=e[1];
+      const tr=document.createElement('tr');
+      const netCol=Math.abs(b.net)<0.005?'var(--t3)':(b.net<0?'var(--dt)':'var(--wt)');
+      tr.innerHTML='<td style="font-weight:600">'+dashEsc(k)+'</td>'
+        +'<td style="text-align:right">'+b.shifts+'</td>'
+        +'<td style="text-align:right;color:'+(b.short?'var(--dt)':'var(--t3)')+'">'+b.short+'</td>'
+        +'<td style="text-align:right;color:'+(b.over?'var(--wt)':'var(--t3)')+'">'+b.over+'</td>'
+        +'<td style="text-align:right;font-weight:700;color:'+netCol+'">'+fmt(b.net)+'</td>'
+        +'<td style="text-align:right;font-weight:700">'+fmt(b.abs)+'</td>';
+      tb.appendChild(tr);
+    });
+    tbl.appendChild(tb);cc.appendChild(tbl);main.appendChild(cc);
+  }
+
+  // Full shift list.
+  const c=el('div','card');
+  const hd=el('div','card-hd');
+  hd.innerHTML='Shifts <span>'+all.length+'</span>';
+  const expBtn=el('button','add-btn','Export CSV');expBtn.style.marginLeft='auto';
+  expBtn.onclick=function(){exportShiftsCSV(all);};
+  hd.appendChild(expBtn);c.appendChild(hd);
+
+  const tbl2=el('table','tbl','<thead><tr><th>Cashier</th><th>Started</th><th>Ended</th>'
+    +'<th style="text-align:right">Float</th><th style="text-align:right">Cash sales</th>'
+    +'<th style="text-align:right">Paid out</th><th style="text-align:right">Expected</th>'
+    +'<th style="text-align:right">Counted</th><th style="text-align:right">Short / Over</th></tr></thead>');
+  const tb2=document.createElement('tbody');
+  all.slice(0,150).forEach(function(x){
+    const notCounted=x.counted_cash===null||x.counted_cash===undefined;
+    const v=+x.variance||0;
+    let badge,vtxt;
+    if(notCounted){badge='b-gray';vtxt='Not counted';}
+    else if(Math.abs(v)<0.005){badge='b-green';vtxt='Balanced';}
+    else if(v<0){badge='b-red';vtxt='Short '+fmt(Math.abs(v));}
+    else{badge='b-amber';vtxt='Over '+fmt(v);}
+    const tr=document.createElement('tr');
+    tr.innerHTML='<td style="font-weight:600">'+dashEsc(x.cashier||'—')+'</td>'
+      +'<td style="white-space:nowrap;font-size:12px">'+fd(x.started_at)+' '+ft(x.started_at)+'</td>'
+      +'<td style="white-space:nowrap;font-size:12px">'+(x.ended_at?ft(x.ended_at):'—')+'</td>'
+      +'<td style="text-align:right">'+fmt(x.opening_float)+'</td>'
+      +'<td style="text-align:right">'+fmt(x.cash_sales)+'</td>'
+      +'<td style="text-align:right">'+fmt(x.paid_out)+'</td>'
+      +'<td style="text-align:right">'+fmt(x.expected_cash)+'</td>'
+      +'<td style="text-align:right">'+(notCounted?'—':fmt(x.counted_cash))+'</td>'
+      +'<td style="text-align:right"><span class="badge '+badge+'">'+vtxt+'</span></td>';
+    tb2.appendChild(tr);
+  });
+  tbl2.appendChild(tb2);c.appendChild(tbl2);main.appendChild(c);
+}
+
+function exportShiftsCSV(rows){
+  const head=['Cashier','Started','Ended','Opening float','Cash sales','Paid out','Expected cash','Counted cash','Variance','Note'];
+  // Quotes doubled and every field wrapped, so a note containing a comma
+  // cannot shift the remaining columns along by one.
+  const q=function(v){return '"'+String(v==null?'':v).replace(/"/g,'""')+'"';};
+  const lines=[head.map(q).join(',')];
+  rows.forEach(function(x){
+    lines.push([x.cashier||'',x.started_at||'',x.ended_at||'',
+      (+x.opening_float||0).toFixed(2),(+x.cash_sales||0).toFixed(2),
+      (+x.paid_out||0).toFixed(2),(+x.expected_cash||0).toFixed(2),
+      (x.counted_cash===null||x.counted_cash===undefined)?'NOT COUNTED':(+x.counted_cash).toFixed(2),
+      (+x.variance||0).toFixed(2),x.note||''].map(q).join(','));
+  });
+  const blob=new Blob([lines.join('\n')],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download='shifts-'+new Date().toISOString().slice(0,10)+'.csv';
+  a.click();
+  setTimeout(function(){URL.revokeObjectURL(a.href);},1000);
 }
 
 function renderRecipes(main){
