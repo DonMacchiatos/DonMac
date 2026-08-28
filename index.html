@@ -113,6 +113,9 @@ input,select,textarea{user-select:text;-webkit-user-select:text}
 .pbtn.big:active{opacity:0.85}
 
 /* INVENTORY */
+/* The Attendance panel has always set className='card', but no such rule
+   existed — that block was rendering completely unstyled. */
+.card{background:var(--bg2);border:1px solid var(--b1);border-radius:14px;padding:14px;margin:0 14px}
 .panel-hd{padding:14px 16px;border-bottom:1px solid var(--b1);display:flex;align-items:center;justify-content:space-between;flex-shrink:0}
 .panel-hd h2{font-size:18px;font-weight:700}
 .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:12px 16px;flex-shrink:0}
@@ -1141,8 +1144,14 @@ async function flushSyncQueue(logFn){
       let ok=false;
       if(item.type==='sale'){
         const r=await fetch(SUPA_URL+'/rest/v1/sales',{method:'POST',headers:cloudHeaders(),body:JSON.stringify(item.data)});
-        // 409 conflict = already exists (duplicate) — treat as success
-        ok=r.ok||r.status===409||r.status===23505;
+        /* A duplicate txn_id is already-done, not a failure. 23505 is the
+           Postgres unique-violation *code*, never an HTTP status, so the old
+           check could never fire; PostgREST reports it as 409, or as a 400
+           carrying the code in the body. */
+        ok=r.ok||r.status===409;
+        if(!ok&&r.status>=400&&r.status<500){
+          try{const b=await r.text();if(b&&b.indexOf('23505')>-1)ok=true;}catch(e){}
+        }
       } else if(item.type==='expense'){
         const r=await fetch(SUPA_URL+'/rest/v1/expenses',{method:'POST',headers:cloudHeaders(),body:JSON.stringify(item.data)});
         ok=r.ok;
@@ -1209,9 +1218,16 @@ async function syncExpenseDeleteToCloud(exp){
   // Cloud rows use a uuid id; rows created offline still carry a local
   // integer id, so fall back to matching on the business + fields.
   const isUuid=typeof exp.id==='string'&&exp.id.indexOf('-')>-1;
+  /* The fallback branch matches on fields rather than a key, so it has to be
+     narrow enough to identify one row. biz_id+name+date alone would delete
+     every expense sharing a name on the same day — two "Milk delivery" rows
+     booked that morning, and both vanish. Including the amount makes a
+     collision much less likely; a true duplicate is indistinguishable anyway. */
   const filter=isUuid
     ?'id=eq.'+encodeURIComponent(exp.id)
-    :'biz_id=eq.'+CLOUD.bizId+'&name=eq.'+encodeURIComponent(exp.name)+'&date=eq.'+encodeURIComponent(exp.date);
+    :'biz_id=eq.'+CLOUD.bizId+'&name=eq.'+encodeURIComponent(exp.name)
+      +'&date=eq.'+encodeURIComponent(exp.date)
+      +'&amount=eq.'+encodeURIComponent(exp.amount);
   if(!CLOUD.token||!CLOUD.bizId){queueAdd('expenseDel',{filter:filter});return;}
   try{
     const r=await fetch(SUPA_URL+'/rest/v1/expenses?'+filter,{method:'DELETE',headers:cloudHeaders()});
@@ -1338,29 +1354,130 @@ async function pushIngStock(list){
   }catch(e){}
 }
 
-/* The Supabase ingredient table is also written by the Dashboard, so its
-   exact columns are not guaranteed here. Write the full row first; if the
-   server rejects it, fall back to the three columns the sale path relies
-   on rather than losing the record entirely. */
-async function saveIngToCloud(ing){
+/* Product stock moved by a sale or a void. applyStockDelta() only touches the
+   local copy, and the full push in saveProductsToCloud() may not run for
+   hours — so the Dashboard's Inventory page sat on whatever stock figure was
+   current at the last full sync. This PATCHes just the stock column (and
+   variants, which carry their own per-variant stock) so the back office sees
+   the movement straight away.
+
+   Matched on local_id, the same key saveProductsToCloud() merges on. Only the
+   stock columns are written, so nothing the Dashboard owns is overwritten. */
+async function pushProductStock(items){
   if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
-  var full={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock,unit:ing.unit||'',
-            cost:+ing.cost||0,low_threshold:+ing.low||0};
-  var lean={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock};
+  if(!items||!items.length)return;
+  // Collapse to one PATCH per product, however many cart lines touched it.
+  var seen={},list=[];
+  for(var i=0;i<items.length;i++){
+    var it=items[i];
+    var p=S.prods.find(function(x){return it.id!==undefined?x.id===it.id:x.name===it.name;});
+    if(!p||p.id===undefined||p.id===null)continue;
+    if(seen[p.id])continue;
+    seen[p.id]=true;list.push(p);
+  }
+  if(!list.length)return;
   try{
     var ch=cloudHeaders();
+    for(var j=0;j<list.length;j++){
+      var pr=list[j];
+      var body={stock:pr.stock};
+      if(pr.variants&&pr.variants.length)body.variants=pr.variants;
+      await fetch(SUPA_URL+'/rest/v1/products?biz_id=eq.'+CLOUD.bizId+'&local_id=eq.'+encodeURIComponent(pr.id),
+        {method:'PATCH',headers:ch,body:JSON.stringify(body)});
+    }
+  }catch(e){console.warn('[Arroyo] pushProductStock failed (stock will catch up on the next full sync)',e);}
+}
+/* The unit cost column is named cost_per_unit — that is what the Dashboard
+   writes and what its COGS, margin and P&L figures read. This used to send a
+   plain `cost`, which PostgREST rejects as an unknown column, so every write
+   fell through to the lean payload below and unit, low_threshold and cost
+   never reached the Dashboard at all. */
+/* One write attempt. On failure the body is read and kept, so a caller can
+   report *why* instead of the old bare `return` that discarded everything. */
+async function prepAttempt(method,url,body,last){
+  /* `Prefer: return=representation` is now always sent. Without it a PATCH
+     against an id that no longer exists in the cloud comes back 200 with an
+     empty body, which the old code read as success — so a local row holding
+     a stale cloudId reported "synced" on every attempt while never actually
+     writing anything. Callers can now see that no row came back and fall
+     back to an INSERT. */
+  var hdrs={...cloudHeaders(),'Prefer':'return=representation'};
+  var r=await fetch(SUPA_URL+url,{method:method,headers:hdrs,body:JSON.stringify(body)});
+  if(r.ok){
+    var rows=null;
+    try{rows=await r.clone().json();}catch(e){}
+    return {ok:true,res:r,rows:rows,empty:Array.isArray(rows)&&rows.length===0};
+  }
+  var t='';
+  try{t=await r.text();}catch(e){}
+  last.status=r.status;last.msg=(t||'').slice(0,200);
+  return {ok:false,res:r,body:t};
+}
+function prepIsDuplicate(last){
+  return last.status===409||String(last.msg||'').indexOf('23505')>-1||
+         String(last.msg||'').toLowerCase().indexOf('duplicate key')>-1;
+}
+
+async function saveIngToCloud(ing){
+  if(!CLOUD.token||!CLOUD.bizId)return {ok:false,msg:'not signed in to the cloud'};
+  if(!navigator.onLine)return {ok:false,msg:'device is offline'};
+  var full={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock,unit:ing.unit||'',
+            cost_per_unit:+ing.cost||0,low_threshold:+ing.low||0};
+  // Middle tier: drop only the cost column. The old code jumped straight to
+  // name+stock, silently throwing away the unit and the low-stock threshold.
+  var mid={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock,unit:ing.unit||'',low_threshold:+ing.low||0};
+  var lean={biz_id:CLOUD.bizId,name:ing.name,stock:ing.stock};
+  var last={status:0,msg:''};
+  try{
     if(ing.cloudId!==null&&ing.cloudId!==undefined){
       var u='/rest/v1/ingredients?id=eq.'+encodeURIComponent(ing.cloudId);
-      var r=await fetch(SUPA_URL+u,{method:'PATCH',headers:ch,body:JSON.stringify(full)});
-      if(!r.ok)await fetch(SUPA_URL+u,{method:'PATCH',headers:ch,body:JSON.stringify(lean)});
-      return;
+      var a=await prepAttempt('PATCH',u,full,last);
+      if(!a.ok)a=await prepAttempt('PATCH',u,mid,last);
+      if(!a.ok)a=await prepAttempt('PATCH',u,lean,last);
+      /* An empty result means the id is stale — the row was removed on the
+         Dashboard, or this device is holding an id from another business.
+         Drop it and fall through to an INSERT rather than reporting a
+         success that wrote nothing. */
+      if(a.ok&&a.empty){ing.cloudId=null;save();}
+      else if(a.ok){ing.syncDirty=false;save();return {ok:true};}
+      else return {ok:false,status:last.status,msg:last.msg};
     }
-    var c=await fetch(SUPA_URL+'/rest/v1/ingredients',{method:'POST',headers:ch,body:JSON.stringify(full)});
-    if(!c.ok)c=await fetch(SUPA_URL+'/rest/v1/ingredients',{method:'POST',headers:ch,body:JSON.stringify(lean)});
-    if(!c.ok)return;
-    var rows=await c.json();
-    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){ing.cloudId=rows[0].id;save();}
-  }catch(e){}
+    var c=await prepAttempt('POST','/rest/v1/ingredients',full,last);
+    if(!c.ok)c=await prepAttempt('POST','/rest/v1/ingredients',mid,last);
+    if(!c.ok)c=await prepAttempt('POST','/rest/v1/ingredients',lean,last);
+    if(!c.ok){
+      /* A duplicate name means the row is already up there under an id this
+         device never recorded. Claim that id rather than reporting a failure
+         and leaving every recipe that points here permanently blocked. */
+      if(prepIsDuplicate(last)){
+        try{
+          var f=await fetch(SUPA_URL+'/rest/v1/ingredients?biz_id=eq.'+CLOUD.bizId+'&name=eq.'+encodeURIComponent(ing.name),{headers:cloudHeaders()});
+          if(f.ok){
+            var ex=await f.json();
+            if(Array.isArray(ex)&&ex[0]&&ex[0].id!=null){ing.cloudId=ex[0].id;ing.syncDirty=false;save();return {ok:true,adopted:true};}
+          }
+        }catch(e){}
+      }
+      return {ok:false,status:last.status,msg:last.msg||'write rejected'};
+    }
+    var rows=c.rows;
+    if(rows===null||rows===undefined){try{rows=await c.res.json();}catch(e){}}
+    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){ing.cloudId=rows[0].id;ing.syncDirty=false;save();return {ok:true};}
+    return {ok:false,status:0,msg:'saved but the server returned no id'};
+  }catch(e){return {ok:false,status:0,msg:(e&&e.message)||'network error'};}
+}
+
+/* A recipe line can only be written once its ingredient holds a cloud id.
+   Every caller used to fire saveRecipeToCloud() straight after creating a
+   brand-new ingredient, while that ingredient's own POST was still in
+   flight — so the recipe came back "blocked", the result was thrown away
+   unread, and the line never reached the Dashboard. This resolves the
+   ingredient first and reports honestly. */
+async function ensureIngCloudId(ing){
+  if(!ing)return false;
+  if(ing.cloudId!==null&&ing.cloudId!==undefined)return true;
+  var r=await saveIngToCloud(ing);
+  return !!(r&&r.ok&&ing.cloudId!==null&&ing.cloudId!==undefined);
 }
 
 async function delIngFromCloud(ing){
@@ -1375,21 +1492,60 @@ async function delIngFromCloud(ing){
 }
 
 async function saveRecipeToCloud(r){
-  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  if(!CLOUD.token||!CLOUD.bizId)return {ok:false,msg:'not signed in to the cloud'};
+  if(!navigator.onLine)return {ok:false,msg:'device is offline'};
   var ing=ingById(r.ingId);
-  if(!ing||ing.cloudId===null||ing.cloudId===undefined)return; // stays local until its ingredient syncs
-  var row={biz_id:CLOUD.bizId,product_name:r.prod,ingredient_id:ing.cloudId,qty_used:+r.qty||0};
+  if(!ing)return {ok:false,msg:'its ingredient no longer exists on this device'};
+  /* Push the ingredient up first if it has never been written. Previously
+     this returned "blocked" and gave up, which is why a recipe added in the
+     same breath as a new ingredient could never sync — nothing ever came
+     back to retry it. */
+  if(ing.cloudId===null||ing.cloudId===undefined){
+    var okIng=await ensureIngCloudId(ing);
+    if(!okIng)return {ok:false,blocked:true,msg:'is waiting on ingredient "'+(ing.name||'?')+'" to sync first'};
+  }
+  /* ingredient_name is denormalised alongside ingredient_id — the Dashboard
+     always writes it, so a row created here without it left a null the
+     Dashboard's recipe list and reports read as blank. */
+  var row={biz_id:CLOUD.bizId,product_name:r.prod,ingredient_id:ing.cloudId,
+           ingredient_name:ing.name||'',qty_used:+r.qty||0};
+  var lean={biz_id:CLOUD.bizId,product_name:r.prod,ingredient_id:ing.cloudId,qty_used:+r.qty||0};
+  var last={status:0,msg:''};
   try{
-    var ch=cloudHeaders();
     if(r.cloudId!==null&&r.cloudId!==undefined){
-      await fetch(SUPA_URL+'/rest/v1/recipes?id=eq.'+encodeURIComponent(r.cloudId),{method:'PATCH',headers:ch,body:JSON.stringify(row)});
-      return;
+      var u='/rest/v1/recipes?id=eq.'+encodeURIComponent(r.cloudId);
+      var a=await prepAttempt('PATCH',u,row,last);
+      if(!a.ok)a=await prepAttempt('PATCH',u,lean,last);
+      /* Empty result = the line is gone from the cloud (commonly removed on
+         the Dashboard). Forget the id and insert it again instead of
+         reporting a silent success forever. */
+      if(a.ok&&a.empty){r.cloudId=null;save();}
+      else if(a.ok){r.syncDirty=false;save();return {ok:true};}
+      else return {ok:false,status:last.status,msg:last.msg};
     }
-    var c=await fetch(SUPA_URL+'/rest/v1/recipes',{method:'POST',headers:ch,body:JSON.stringify(row)});
-    if(!c.ok)return;
-    var rows=await c.json();
-    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){r.cloudId=rows[0].id;save();}
-  }catch(e){}
+    var c=await prepAttempt('POST','/rest/v1/recipes',row,last);
+    if(!c.ok)c=await prepAttempt('POST','/rest/v1/recipes',lean,last);
+    if(!c.ok){
+      // Same line already up there (usually added from the Dashboard) — claim
+      // its id instead of failing forever.
+      if(prepIsDuplicate(last)){
+        try{
+          var f=await fetch(SUPA_URL+'/rest/v1/recipes?biz_id=eq.'+CLOUD.bizId
+            +'&product_name=eq.'+encodeURIComponent(r.prod)
+            +'&ingredient_id=eq.'+encodeURIComponent(ing.cloudId),{headers:cloudHeaders()});
+          if(f.ok){
+            var ex=await f.json();
+            if(Array.isArray(ex)&&ex[0]&&ex[0].id!=null){r.cloudId=ex[0].id;r.syncDirty=false;save();return {ok:true,adopted:true};}
+          }
+        }catch(e){}
+      }
+      return {ok:false,status:last.status,msg:last.msg||'write rejected'};
+    }
+    var rows=c.rows;
+    if(rows===null||rows===undefined){try{rows=await c.res.json();}catch(e){}}
+    if(Array.isArray(rows)&&rows[0]&&rows[0].id!==undefined){r.cloudId=rows[0].id;r.syncDirty=false;save();return {ok:true};}
+    return {ok:false,status:0,msg:'saved but the server returned no id'};
+  }catch(e){return {ok:false,status:0,msg:(e&&e.message)||'network error'};}
 }
 
 async function delRecipeFromCloud(r){
@@ -1398,6 +1554,82 @@ async function delRecipeFromCloud(r){
   try{
     await fetch(SUPA_URL+'/rest/v1/recipes?id=eq.'+encodeURIComponent(r.cloudId),{method:'DELETE',headers:cloudHeaders()});
   }catch(e){}
+}
+
+/* ==================================================================== *
+ * PREP SYNC RETRY
+ *
+ * Ingredients and recipe lines used to be written with a bare
+ * `saveRecipeToCloud(r)` — no await, no look at the result. Anything that
+ * failed (offline, expired session, ingredient not yet in the cloud) was
+ * gone: nothing recorded the failure, so nothing ever tried again, and the
+ * till kept showing "Recipe line added" while the Dashboard stayed empty.
+ *
+ * Every local write now marks the row dirty and clears the mark only once
+ * the cloud has confirmed it. Anything still dirty is retried on reconnect,
+ * on sign-in and on a slow timer, and the Prep tab shows the outstanding
+ * count so a failure is visible instead of silent.
+ * ==================================================================== */
+function markIngDirty(ing){if(ing)ing.syncDirty=true;}
+function markRecipeDirty(r){if(r)r.syncDirty=true;}
+
+function prepPendingCount(){
+  var n=0;
+  (S.ings||[]).forEach(function(i){if(i.syncDirty||i.cloudId===null||i.cloudId===undefined)n++;});
+  (S.recipes||[]).forEach(function(r){if(r.syncDirty||r.cloudId===null||r.cloudId===undefined)n++;});
+  return n;
+}
+
+/* Writes one ingredient and reports the outcome to the person at the till. */
+async function syncIngNow(ing,quiet){
+  markIngDirty(ing);save();
+  if(!CLOUD.token||!CLOUD.bizId){if(!quiet)toast('Saved on this device — sign in to sync');return false;}
+  if(!navigator.onLine){if(!quiet)toast('Saved offline — will sync when back online');return false;}
+  var res=await saveIngToCloud(ing);
+  if(res&&res.ok){if(!quiet)toast('Ingredient synced');render();return true;}
+  if(!quiet)toast('Sync failed: '+((res&&res.msg)||'unknown')+' — will retry');
+  render();
+  return false;
+}
+
+/* Writes one recipe line, pulling its ingredient up first if it has never
+   been synced. This is the path the recipe modal now awaits. */
+async function syncRecipeNow(r,quiet){
+  markRecipeDirty(r);save();
+  if(!CLOUD.token||!CLOUD.bizId){if(!quiet)toast('Saved on this device — sign in to sync');return false;}
+  if(!navigator.onLine){if(!quiet)toast('Saved offline — will sync when back online');return false;}
+  var res=await saveRecipeToCloud(r);
+  if(res&&res.ok){if(!quiet)toast('Recipe synced to Dashboard');render();return true;}
+  if(!quiet)toast('Recipe sync failed: '+((res&&res.msg)||'unknown')+' — will retry');
+  render();
+  return false;
+}
+
+var PREP_RETRY_RUNNING=false;
+/* Retries everything still outstanding. Ingredients go first — a recipe line
+   cannot be written until the ingredient it points at has an id. */
+async function retryPrepSync(log){
+  if(PREP_RETRY_RUNNING)return {ings:0,recipes:0,failed:0};
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return {ings:0,recipes:0,failed:0};
+  var dirtyIngs=(S.ings||[]).filter(function(i){return i.syncDirty||i.cloudId===null||i.cloudId===undefined;});
+  var dirtyRecs=(S.recipes||[]).filter(function(r){return r.syncDirty||r.cloudId===null||r.cloudId===undefined;});
+  if(!dirtyIngs.length&&!dirtyRecs.length)return {ings:0,recipes:0,failed:0};
+  PREP_RETRY_RUNNING=true;
+  var stat={ings:0,recipes:0,failed:0};
+  try{
+    for(var i=0;i<dirtyIngs.length;i++){
+      var ri=await saveIngToCloud(dirtyIngs[i]);
+      if(ri&&ri.ok)stat.ings++;else stat.failed++;
+    }
+    for(var j=0;j<dirtyRecs.length;j++){
+      var rr=await saveRecipeToCloud(dirtyRecs[j]);
+      if(rr&&rr.ok)stat.recipes++;else stat.failed++;
+    }
+    save();
+    if(log)log('Retried prep data: '+stat.ings+' ingredient(s), '+stat.recipes+' recipe line(s)'+(stat.failed?', '+stat.failed+' still pending':''),stat.failed===0);
+  }catch(e){}
+  PREP_RETRY_RUNNING=false;
+  return stat;
 }
 
 /* Pulls whatever the Dashboard has, matching cloud rows to local ones by
@@ -1435,10 +1667,18 @@ async function loadIngredientsFromCloud(){
       S.ings.push(local);
     }
     local.cloudId=row.id;
+    /* A row still waiting to be pushed keeps its local values. Overwriting it
+       from the cloud here used to quietly undo whatever the till had just
+       typed, which looked exactly like "the edit didn't save". */
+    if(local.syncDirty)return;
     if(row.name)local.name=row.name;
     if(row.stock!==undefined&&row.stock!==null)local.stock=ingRound(row.stock);
     if(row.unit!==undefined&&row.unit!==null)local.unit=row.unit;
-    if(row.cost!==undefined&&row.cost!==null)local.cost=+row.cost||0;
+    /* Read cost_per_unit — the column the Dashboard writes. Older rows may
+       still carry a plain `cost`, so accept either and prefer the new one. */
+    var rowCost=(row.cost_per_unit!==undefined&&row.cost_per_unit!==null)?row.cost_per_unit
+               :((row.cost!==undefined&&row.cost!==null)?row.cost:null);
+    if(rowCost!==null)local.cost=+rowCost||0;
     if(row.low_threshold!==undefined&&row.low_threshold!==null)local.low=+row.low_threshold||0;
   });
 
@@ -1458,6 +1698,8 @@ async function loadIngredientsFromCloud(){
     }
     if(!ex){ex={id:S.recipeNid++,cloudId:row.id,prod:row.product_name,ingId:ing.id,qty:0};S.recipes.push(ex);}
     ex.cloudId=row.id;
+    // Same rule as ingredients: an unpushed local edit wins over the cloud.
+    if(ex.syncDirty)return;
     ex.prod=row.product_name;
     ex.ingId=ing.id;
     ex.qty=+row.qty_used||0;
@@ -1469,13 +1711,21 @@ async function loadCloudData(silent){
   if(!silent)toast('Syncing from cloud...');
   try{
     const ch=cloudHeaders();
+    /* These limits have to be at least as generous as the ones reconcileSales
+       and reconcileExpenses read with (10000). They used to be 500 and 200, so
+       a full sync pushed everything up and then pulled back only the newest
+       slice — older sales stayed safe in the cloud but vanished from this
+       device's History, which reads as data loss to whoever is at the till. */
     const [sales,expenses,prods]=await Promise.all([
-      fetch(SUPA_URL+'/rest/v1/sales?biz_id=eq.'+CLOUD.bizId+'&order=date.desc&limit=500',{headers:ch}).then(r=>r.json()),
-      fetch(SUPA_URL+'/rest/v1/expenses?biz_id=eq.'+CLOUD.bizId+'&order=date.desc&limit=200',{headers:ch}).then(r=>r.json()),
+      fetch(SUPA_URL+'/rest/v1/sales?biz_id=eq.'+CLOUD.bizId+'&order=date.desc&limit=10000',{headers:ch}).then(r=>r.json()),
+      fetch(SUPA_URL+'/rest/v1/expenses?biz_id=eq.'+CLOUD.bizId+'&order=date.desc&limit=10000',{headers:ch}).then(r=>r.json()),
       fetch(SUPA_URL+'/rest/v1/products?biz_id=eq.'+CLOUD.bizId,{headers:ch}).then(r=>r.json()),
     ]);
     if(Array.isArray(sales)){
-      S.sales=sales.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||''}));
+      /* salePayload sends queue_no / queue_status / queue_day up, but nothing
+         read them back, so every full sync silently stripped the queue
+         numbers off this device's sales. */
+      S.sales=sales.map(s=>({id:s.txn_id,date:s.date,total:s.total,method:s.method,items:s.items||[],cashier:s.cashier||'',ref:s.ref||'',voided:s.voided||false,receipt:s.receipt||'',disc:s.discount||0,voidedBy:s.voided_by||'',voidedAt:s.voided_at||'',queueNo:s.queue_no||0,queueStatus:s.queue_status||'',queueDay:s.queue_day||null}));
       S.salesTotal=S.sales.filter(s=>!s.voided).reduce((a,s)=>a+s.total,0);
     }
     if(Array.isArray(expenses)){S.expenses=expenses.map(e=>({id:e.id,name:e.name,amount:e.amount,cat:e.cat,date:e.date}));}
@@ -1493,6 +1743,10 @@ async function loadCloudData(silent){
   await loadCloudCustomers();
   await loadAttEmployees();
   await loadIngredientsFromCloud();
+  /* Push anything the till created while it was signed out or offline. The
+     pull above only brings the Dashboard's copy down; without this a locally
+     created recipe would keep losing to it. */
+  await retryPrepSync();
 }
 async function saveProductsToCloud(){
   if(!CLOUD.token||!CLOUD.bizId)return false;
@@ -1509,32 +1763,29 @@ async function saveProductsToCloud(){
     // --- SMART MERGE (replaces wipe+repost) ---
     // Fetch current cloud products so we can diff instead of overwrite.
     // This preserves any edits made from the Dashboard.
-    let cloudProds=[];
+    /* null means "this run never learned what the cloud holds"; [] means the
+       cloud genuinely holds nothing. Conflating the two was the bug: a failed
+       fetch left an empty array, every local product then looked new, and the
+       loop below posted a second copy of all of them. */
+    let cloudProds=null;
     try{
       const fetchRes=await fetch(SUPA_URL+'/rest/v1/products?biz_id=eq.'+CLOUD.bizId,{headers:ch});
-      if(fetchRes.ok)cloudProds=await fetchRes.json();
-    }catch(e){console.warn('[Arroyo] saveProductsToCloud: could not fetch cloud products, falling back to full replace',e);}
+      if(fetchRes.ok){
+        const body=await fetchRes.json();
+        if(Array.isArray(body))cloudProds=body;
+        else console.warn('[Arroyo] saveProductsToCloud: cloud fetch returned non-array');
+      } else {
+        console.warn('[Arroyo] saveProductsToCloud: cloud fetch failed',fetchRes.status);
+      }
+    }catch(e){console.warn('[Arroyo] saveProductsToCloud: could not fetch cloud products',e);}
 
-    // If fetch failed entirely, fall back to old wipe+repost so we still save something
-    if(!Array.isArray(cloudProds)){
-      console.warn('[Arroyo] saveProductsToCloud: cloud fetch returned non-array, falling back to full replace');
-      cloudProds=null;
-    }
-
+    /* No fallback wipe+repost here. Deleting every cloud product on the
+       strength of a read that just failed would also delete anything the
+       Dashboard added and this device has not pulled yet. Report the failure
+       and let the next sync try again — the local copy is untouched. */
     if(cloudProds===null){
-      // --- fallback: full wipe+repost ---
-      let delRes=await fetch(SUPA_URL+'/rest/v1/products?biz_id=eq.'+CLOUD.bizId,{method:'DELETE',headers:ch});
-      if(!delRes.ok&&(delRes.status===401||delRes.status===403)){
-        const refreshed=await refreshSession();
-        if(refreshed){ch=cloudHeaders();delRes=await fetch(SUPA_URL+'/rest/v1/products?biz_id=eq.'+CLOUD.bizId,{method:'DELETE',headers:ch});}
-      }
-      if(!delRes.ok){console.error('saveProductsToCloud DELETE failed:',delRes.status,await delRes.text());return false;}
-      if(S.prods.length>0){
-        const rows=S.prods.map(p=>({biz_id:CLOUD.bizId,local_id:p.id,name:p.name,price:p.price,cat:p.cat,icon:p.icon,stock:p.stock,variants:p.variants||[],img:p.img||null,sale_pct:p.salePct||0,barcode:p.barcode||null}));
-        const postRes=await fetch(SUPA_URL+'/rest/v1/products',{method:'POST',headers:ch,body:JSON.stringify(rows)});
-        if(!postRes.ok){console.error('saveProductsToCloud POST failed:',postRes.status,await postRes.text());return false;}
-      }
-      return true;
+      console.error('saveProductsToCloud: could not read cloud products — aborting rather than overwriting');
+      return false;
     }
 
     // Build lookup maps: local_id → cloud row (uuid), local_id → local prod
@@ -1551,20 +1802,32 @@ async function saveProductsToCloud(){
     }
 
     // 2. PATCH existing or POST new for each local product
+    /* Only thrown network errors were caught here; an HTTP rejection (bad
+       column, RLS denial, constraint violation) was never looked at, so this
+       function returned true no matter what and the sync log always said
+       "Products pushed". Count real outcomes instead. */
+    let pFail=0,lastErr='';
     for(const p of S.prods){
       const existing=cloudByLocalId[p.id];
       const row={biz_id:CLOUD.bizId,local_id:p.id,name:p.name,price:p.price,cat:p.cat,icon:p.icon,stock:p.stock,variants:p.variants||[],img:p.img||null,sale_pct:p.salePct||0,barcode:p.barcode||null};
       try{
+        let res;
         if(existing){
           // PATCH — only fields POS owns; preserve dashboard-only fields that POS doesn't touch
-          await fetch(SUPA_URL+'/rest/v1/products?id=eq.'+existing.id,{method:'PATCH',headers:{...ch,'Prefer':'return=representation'},body:JSON.stringify(row)});
+          res=await fetch(SUPA_URL+'/rest/v1/products?id=eq.'+existing.id,{method:'PATCH',headers:{...ch,'Prefer':'return=representation'},body:JSON.stringify(row)});
         }else{
           // POST — new product added on POS
-          await fetch(SUPA_URL+'/rest/v1/products',{method:'POST',headers:{...ch,'Prefer':'return=representation'},body:JSON.stringify(row)});
+          res=await fetch(SUPA_URL+'/rest/v1/products',{method:'POST',headers:{...ch,'Prefer':'return=representation'},body:JSON.stringify(row)});
         }
-      }catch(e){console.warn('[Arroyo] saveProductsToCloud: upsert failed for local_id',p.id,e);}
+        if(!res.ok){
+          pFail++;
+          try{lastErr=(await res.text()||'').slice(0,200);}catch(e){}
+          console.warn('[Arroyo] saveProductsToCloud: '+(existing?'PATCH':'POST')+' rejected for local_id',p.id,res.status,lastErr);
+        }
+      }catch(e){pFail++;lastErr=(e&&e.message)||'network error';console.warn('[Arroyo] saveProductsToCloud: upsert failed for local_id',p.id,e);}
     }
-    console.log('[Arroyo] saveProductsToCloud: smart merge complete. local='+S.prods.length+' cloud_before='+cloudProds.length);
+    console.log('[Arroyo] saveProductsToCloud: smart merge complete. local='+S.prods.length+' cloud_before='+cloudProds.length+' failed='+pFail);
+    if(pFail>0){console.error('saveProductsToCloud: '+pFail+' product(s) rejected. Last error: '+lastErr);return false;}
     return true;
   }catch(e){console.error('saveProductsToCloud error:',e);return false;}
 }
@@ -1735,21 +1998,99 @@ async function reconcileExpenses(log){
   return stat;
 }
 
+/* Claims the cloud ids for prep rows that are already up there.
+
+   This has to run before anything is written. pushPrepData() used to POST
+   straight away, and the only code that ever matched a local ingredient to an
+   existing cloud row by name was loadIngredientsFromCloud() — which runs at
+   the *end* of a full sync, after the push. So an ingredient created on the
+   Dashboard, or one whose id was lost when an earlier push died halfway,
+   arrived here with no cloudId, POSTed a second copy, and where the table has
+   a unique index on (biz_id, name) was rejected outright. Either way it came
+   away without an id, and since a recipe line cannot be written until its
+   ingredient has one, a single stuck ingredient silently blocked every recipe
+   that used it. That is the "failed" the sync log was reporting.
+
+   Only ids are taken here — stock, cost, unit and quantities are untouched —
+   so this stays safe to run before an upload: nothing local is overwritten. */
+async function adoptPrepCloudIds(log){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return false;
+  var ch=cloudHeaders(), ingRows=null, recRows=null;
+  try{
+    var r1=await fetch(SUPA_URL+'/rest/v1/ingredients?biz_id=eq.'+CLOUD.bizId,{headers:ch});
+    if(r1.ok)ingRows=await r1.json();
+  }catch(e){}
+  try{
+    var r2=await fetch(SUPA_URL+'/rest/v1/recipes?biz_id=eq.'+CLOUD.bizId,{headers:ch});
+    if(r2.ok)recRows=await r2.json();
+  }catch(e){}
+  if(!Array.isArray(ingRows)){
+    if(log)log('Could not read the Dashboard\u2019s ingredient list \u2014 pushing without it',false);
+    return false;
+  }
+  var norm=function(v){return String(v||'').trim().toLowerCase();};
+  var adopted=0;
+  var byName={};
+  ingRows.forEach(function(row){if(row&&row.id!=null)byName[norm(row.name)]=row.id;});
+  S.ings.forEach(function(i){
+    if(i.cloudId!==null&&i.cloudId!==undefined)return;
+    var hit=byName[norm(i.name)];
+    if(hit!=null){i.cloudId=hit;adopted++;}
+  });
+  if(Array.isArray(recRows)){
+    var recKey={};
+    recRows.forEach(function(row){
+      if(row&&row.id!=null)recKey[norm(row.product_name)+'|'+String(row.ingredient_id)]=row.id;
+    });
+    S.recipes.forEach(function(r){
+      if(r.cloudId!==null&&r.cloudId!==undefined)return;
+      var ing=ingById(r.ingId);
+      if(!ing||ing.cloudId===null||ing.cloudId===undefined)return;
+      var hit=recKey[norm(r.prod)+'|'+String(ing.cloudId)];
+      if(hit!=null){r.cloudId=hit;adopted++;}
+    });
+  }
+  if(adopted){
+    save();
+    if(log)log('Matched '+adopted+' entr'+(adopted===1?'y':'ies')+' that already existed on the Dashboard',true);
+  }
+  return true;
+}
+
 async function pushPrepData(log){
-  const stat={ings:0,recipes:0};
+  const stat={ings:0,recipes:0,ingFail:0,recFail:0,blocked:0};
   if(!S.ings.length&&!S.recipes.length){log('No ingredients or recipes to push',true);return stat;}
+  // Claim any ids that already exist up there before writing anything.
+  await adoptPrepCloudIds(log);
   // Ingredients first: a recipe cannot be written until the ingredient it
   // points at has a cloud id to reference.
   for(let i=0;i<S.ings.length;i++){
-    await saveIngToCloud(S.ings[i]);
-    if(S.ings[i].cloudId!==null&&S.ings[i].cloudId!==undefined)stat.ings++;
+    const ing=S.ings[i];
+    const res=await saveIngToCloud(ing);
+    if(res&&res.ok)stat.ings++;
+    else{
+      stat.ingFail++;
+      log('Ingredient \u201c'+(ing.name||'?')+'\u201d failed'
+        +(res&&res.status?' ('+res.status+')':'')
+        +(res&&res.msg?': '+res.msg:''),false);
+    }
   }
-  if(S.ings.length)log('Pushed '+stat.ings+' of '+S.ings.length+' ingredient(s)',stat.ings===S.ings.length);
+  if(S.ings.length)log('Pushed '+stat.ings+' of '+S.ings.length+' ingredient(s)',stat.ingFail===0);
   for(let j=0;j<S.recipes.length;j++){
-    await saveRecipeToCloud(S.recipes[j]);
-    if(S.recipes[j].cloudId!==null&&S.recipes[j].cloudId!==undefined)stat.recipes++;
+    const rec=S.recipes[j];
+    const res=await saveRecipeToCloud(rec);
+    if(res&&res.ok)stat.recipes++;
+    else if(res&&res.blocked){
+      stat.blocked++;
+      log('Recipe for \u201c'+(rec.prod||'?')+'\u201d '+res.msg,false);
+    } else {
+      stat.recFail++;
+      log('Recipe for \u201c'+(rec.prod||'?')+'\u201d failed'
+        +(res&&res.status?' ('+res.status+')':'')
+        +(res&&res.msg?': '+res.msg:''),false);
+    }
   }
-  if(S.recipes.length)log('Pushed '+stat.recipes+' of '+S.recipes.length+' recipe line(s)',stat.recipes===S.recipes.length);
+  if(S.recipes.length)log('Pushed '+stat.recipes+' of '+S.recipes.length+' recipe line(s)',(stat.recFail+stat.blocked)===0);
   return stat;
 }
 
@@ -1811,13 +2152,20 @@ async function syncEverything(log){
   const setOk=await saveSettingsToCloud();
   log(setOk?'Shop settings pushed':'Settings failed to push (non-critical)',setOk);
 
-  await pushPrepData(log);
+  const prep=await pushPrepData(log);
+  /* Anything still without a cloud id after the push did not land. The old
+     code reported {ok:prodOk} only, so a run that failed to push a single
+     ingredient or recipe still told the user "Sync complete". */
+  const prepLeft=unsyncedPrepCount();
+  if(prepLeft>0)log(prepLeft+' ingredient/recipe entr'+(prepLeft===1?'y':'ies')+' still not on the Dashboard',false);
 
   log('Pulling the latest back from the Dashboard...');
   await loadCloudData(true);
   save();
-  log('Everything on this device is now on the Dashboard.',true);
-  return {ok:prodOk,sales:sales,expenses:exps,reason:''};
+  const allOk=prodOk&&prepLeft===0;
+  log(allOk?'Everything on this device is now on the Dashboard.'
+           :'Finished, but some items did not go up — run this again in a moment.',allOk);
+  return {ok:allOk,sales:sales,expenses:exps,prep:prep,settings:setOk,prepLeft:prepLeft,reason:allOk?'':'partial'};
 }
 
 const BT=[
@@ -1850,6 +2198,10 @@ let S={
   cart:[],cat:'All',search:'',disc:0,discType:'%',
   pass:'1234',locked:true,nid:10,sales:[],salesTotal:0,
   modal:null,histFilter:'all',cashTendered:0,
+  // A specific day chosen in History / Expenses. Empty means use the pills.
+  histDate:'',expDate:'',
+  // Cash drawer. openShift holds the running shift; shiftLog keeps closed ones.
+  openShift:null,shiftLog:[],shiftNid:1,
   themeColor:PREFILL.themeColor||'#111110',cartOpen:false,requireRef:false,
   bizLogo:PREFILL.bizLogo||null,dailyGoal:PREFILL.dailyGoal||0,
   expenses:[],expenseNid:1,expFilter:'today',
@@ -1967,6 +2319,10 @@ function load(){
     if(d.cashierNid)S.cashierNid=d.cashierNid;
     if(d.activeCashier)S.activeCashier=d.activeCashier;
     if(d.shiftStart)S.shiftStart=d.shiftStart;
+    if(d.openShift)S.openShift=d.openShift;
+    if(Array.isArray(d.shiftLog))S.shiftLog=d.shiftLog;
+    if(d.shiftNid)S.shiftNid=d.shiftNid;
+    S.shiftLog.forEach(function(x){if((parseInt(x.id)||0)>=S.shiftNid)S.shiftNid=(parseInt(x.id)||0)+1;});
     if(Array.isArray(d.ings))S.ings=d.ings;
     if(d.ingNid)S.ingNid=d.ingNid;
     if(Array.isArray(d.recipes))S.recipes=d.recipes;
@@ -2057,6 +2413,7 @@ function save(){
       expenses:S.expenses,expenseNid:S.expenseNid,
       cashiers:S.cashiers,cashierNid:S.cashierNid,
       activeCashier:S.activeCashier,shiftStart:S.shiftStart,
+      openShift:S.openShift,shiftLog:S.shiftLog,shiftNid:S.shiftNid,
       ings:S.ings,ingNid:S.ingNid,recipes:S.recipes,recipeNid:S.recipeNid
     }));
     if(CLOUD.token)localStorage.setItem('arroyo_cloud',JSON.stringify({user:CLOUD.user,token:CLOUD.token,refresh:CLOUD.refresh,bizId:CLOUD.bizId,email:S.cloudEmail,bizName:S.cloudBizName}));
@@ -2141,6 +2498,15 @@ function applyTheme(hex){
 
 function fmt(n){return CUR+(+n).toFixed(2);}
 
+/* Escapes text before it goes anywhere near innerHTML. There was already an
+   esc() in this file, but it lives inside the queue IIFE further down and was
+   never reachable from the render functions up here — product names, cashier
+   names, expense descriptions and category labels are all operator-supplied
+   and were being concatenated into markup unescaped. A product named
+   Tom & Jerry's rendered wrong; anything with a tag in it rendered worse. */
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+
 function toast(msg){
   const t=document.createElement('div');
   t.className='toast';t.textContent=msg;
@@ -2216,7 +2582,9 @@ function initBiz(id){
 
 function addToCart(p){
   const ex=S.cart.find(i=>i.id===p.id);
-  if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:p.price,qty:1});
+  // cat travels with the line so the sale records it at checkout and the
+  // category report stays correct even if the product is later renamed.
+  if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:p.price,qty:1,cat:p.cat||'Uncategorised'});
   render();toast(p.name+' added');
 }
 
@@ -2771,7 +3139,15 @@ function renderWizard(app){
             const created=await createRes.json();
             if(created&&created[0])CLOUD.bizId=created[0].id;
           }
-          save();saveSession&&saveSession();
+          /* Was: save();saveSession&&saveSession();
+             There is no saveSession() in this file — that name only exists in
+             the Dashboard. A bare reference to an undeclared identifier throws
+             a ReferenceError (unlike typeof, `x && x()` does not guard), and
+             the throw was swallowed by the catch below, so the localStorage
+             write on the next line never ran: finishing the setup wizard left
+             the cloud session unsaved and the till looked signed out after a
+             reload. */
+          save();
           localStorage.setItem('arroyo_cloud',JSON.stringify({user:CLOUD.user,token:CLOUD.token,refresh:CLOUD.refresh,bizId:CLOUD.bizId,email:S.cloudEmail,bizName:WIZ.bizName}));
         }catch(e){console.error('Wizard biz sync error:',e);}
       }
@@ -2913,18 +3289,127 @@ function renderCloudAuth(app){
   setTimeout(()=>{const ei2=document.getElementById('authEmail');if(ei2)ei2.focus();},100);
 }
 
+/* ==================================================================== *
+ * CASH DRAWER — FLOAT, SHIFT RECONCILIATION, SHORT / OVER
+ *
+ * A shift opens with a counted float (the "cash on hand" the cashier starts
+ * with) and closes with a second count. What the drawer should hold is
+ * derived, never typed:
+ *
+ *   expected = opening float + cash sales - cash paid out
+ *
+ * Only Cash sales move the drawer: GCash and Credit take no notes, so
+ * folding them in would have made every shift look short by the value of
+ * its cashless trade. Voided sales are excluded for the same reason.
+ * ==================================================================== */
+
+// Sales taken during a shift, split by tender.
+function shiftSalesBreakdown(sh){
+  const out={cash:0,gcash:0,credit:0,other:0,total:0,count:0,voided:0};
+  if(!sh)return out;
+  const from=new Date(sh.startedAt).getTime();
+  const to=sh.endedAt?new Date(sh.endedAt).getTime():Date.now();
+  (S.sales||[]).forEach(function(s){
+    const t=new Date(s.date).getTime();
+    if(isNaN(t)||t<from||t>to)return;
+    if(s.voided){out.voided++;return;}
+    const amt=+s.total||0;
+    out.count++;out.total+=amt;
+    const m=s.method||'Cash';
+    if(m==='Cash')out.cash+=amt;
+    else if(m==='GCash')out.gcash+=amt;
+    else if(m==='Utang')out.credit+=amt;
+    else out.other+=amt;
+  });
+  return out;
+}
+
+// Expenses recorded during a shift — the default assumption is drawer cash.
+function shiftPaidOut(sh){
+  if(!sh)return 0;
+  const from=new Date(sh.startedAt).getTime();
+  const to=sh.endedAt?new Date(sh.endedAt).getTime():Date.now();
+  return (S.expenses||[]).filter(function(e){
+    const t=new Date(e.date).getTime();
+    return !isNaN(t)&&t>=from&&t<=to;
+  }).reduce(function(a,e){return a+(+e.amount||0);},0);
+}
+
+function expectedDrawer(sh,paidOut){
+  if(!sh)return 0;
+  const b=shiftSalesBreakdown(sh);
+  const po=(paidOut===undefined||paidOut===null)?shiftPaidOut(sh):(+paidOut||0);
+  return (+sh.openingFloat||0)+b.cash-po;
+}
+
+/* Pushes a closed shift up if the table exists. Written defensively: an
+   install whose Supabase has no `shifts` table simply keeps the record on
+   the device instead of throwing an error at the cashier. */
+async function pushShiftToCloud(sh){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return false;
+  const b=shiftSalesBreakdown(sh);
+  const full={biz_id:CLOUD.bizId,cashier:sh.cashier||'',employee_id:sh.supaId||null,
+    started_at:sh.startedAt,ended_at:sh.endedAt,
+    opening_float:+sh.openingFloat||0,cash_sales:b.cash,paid_out:+sh.paidOut||0,
+    expected_cash:+sh.expected||0,counted_cash:+sh.countedCash||0,
+    variance:+sh.variance||0,note:sh.note||''};
+  const lean={biz_id:CLOUD.bizId,cashier:sh.cashier||'',started_at:sh.startedAt,
+    ended_at:sh.endedAt,opening_float:+sh.openingFloat||0,
+    counted_cash:+sh.countedCash||0,variance:+sh.variance||0};
+  const last={status:0,msg:''};
+  try{
+    let a=await prepAttempt('POST','/rest/v1/shifts',full,last);
+    if(!a.ok)a=await prepAttempt('POST','/rest/v1/shifts',lean,last);
+    if(!a.ok){sh.cloudSynced=false;save();return false;}
+    sh.cloudSynced=true;save();
+    return true;
+  }catch(e){sh.cloudSynced=false;save();return false;}
+}
+
+// A small labelled money row, used throughout the drawer screens.
+function drawerRow(label,value,opts){
+  opts=opts||{};
+  const r=document.createElement('div');
+  r.style.cssText='display:flex;justify-content:space-between;align-items:baseline;padding:'
+    +(opts.tight?'4px':'7px')+' 0'+(opts.rule?';border-top:1px solid var(--b2);margin-top:4px;padding-top:9px':'');
+  const l=document.createElement('span');
+  l.style.cssText='font-size:'+(opts.big?'13.5':'12.5')+'px;color:'+(opts.big?'var(--t1)':'var(--t2)')
+    +';font-weight:'+(opts.big?'800':'600');
+  l.textContent=label;
+  const v=document.createElement('span');
+  v.style.cssText='font-size:'+(opts.big?'16':'13.5')+'px;font-weight:'+(opts.big?'800':'700')
+    +';color:'+(opts.color||'var(--t1)');
+  v.textContent=value;
+  r.appendChild(l);r.appendChild(v);
+  return r;
+}
+
+/* Short / over, phrased the way a cashier would say it out loud. `rec` is
+   optional; passing a shift record lets an abandoned drawer report itself as
+   uncounted instead of showing a variance of zero as "Balanced", which would
+   have read as a clean shift when in fact nobody ever counted it. */
+function varianceLabel(v,rec){
+  if(rec&&(rec.unreconciled||rec.countedCash===null||rec.countedCash===undefined))
+    return{text:'NOT COUNTED',color:'var(--t3)',detail:'This drawer was never counted, so no short/over can be worked out.'};
+  const a=Math.abs(v);
+  if(a<0.005)return{text:'Balanced',color:'var(--st)',detail:'The drawer matches exactly.'};
+  if(v>0)return{text:'OVER '+fmt(a),color:'var(--wt)',detail:'There is more cash in the drawer than the sales account for.'};
+  return{text:'SHORT '+fmt(a),color:'var(--dt)',detail:'There is less cash in the drawer than the sales account for.'};
+}
+
 function renderCashierLogin(app){
   const w=document.createElement('div');w.style.cssText='flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;padding:28px 20px;gap:16px;background:var(--bg0)';
   if(S.bizLogo){const lg=document.createElement('img');lg.src=S.bizLogo;lg.style.cssText='width:72px;height:72px;border-radius:16px;object-fit:contain;border:2px solid var(--b2)';w.appendChild(lg);}
   const ttl=document.createElement('div');ttl.style.cssText='font-size:20px;font-weight:800;text-align:center';ttl.textContent=S.bizName;w.appendChild(ttl);
-  const hint=document.createElement('div');hint.style.cssText='font-size:13px;color:var(--t2)';hint.textContent='Select your name to start shift';w.appendChild(hint);
+  const hint=document.createElement('div');hint.style.cssText='font-size:13px;color:var(--t2);text-align:center;line-height:1.5';hint.textContent='Select your name, then count your starting cash';w.appendChild(hint);
   const list=document.createElement('div');list.style.cssText='width:100%;max-width:320px;display:flex;flex-direction:column;gap:8px';
   S.cashiers.forEach(c=>{
     const btn=document.createElement('button');btn.style.cssText='width:100%;padding:16px;border-radius:14px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:16px;font-weight:600;cursor:pointer;text-align:left';
-    btn.textContent=c.name;btn.onclick=async function(){
-      S.activeCashier=c;S.shiftStart=new Date().toISOString();S.alertDismissed=false;save();
-      toast('Welcome, '+c.name+'!');render();
-    };
+    /* Check-in now goes through the float count. The shift is not started
+       here — openShiftModal does that once the cashier has entered the cash
+       they are holding, so there is always an opening figure to reconcile
+       against at the end. */
+    btn.textContent=c.name;btn.onclick=function(){openModal({type:'openShift',cashier:c});};
     list.appendChild(btn);
   });
   w.appendChild(list);
@@ -2932,33 +3417,124 @@ function renderCashierLogin(app){
   app.appendChild(w);
 }
 
+/* Sales taken on a given local day, ignoring voided ones. Used so the
+   Expenses tab can show net profit for whichever day is selected rather than
+   always comparing against today's takings. */
+function salesOnDay(key){
+  return (S.sales||[]).filter(function(s){
+    return !s.voided&&dayKey(s.date)===key;
+  }).reduce(function(a,s){return a+(+s.total||0);},0);
+}
+
 function renderExp(scr){
-  const today=new Date().toDateString();
-  const todayExpAmt=S.expenses.filter(e=>new Date(e.date).toDateString()===today).reduce((a,e)=>a+e.amount,0);
-  const todayNet=todaySales()-todayExpAmt;
   const hd=document.createElement('div');hd.className='panel-hd';hd.innerHTML='<h2>Expenses</h2>';
-  const addb=document.createElement('button');addb.className='abtn';addb.textContent='+ Add';addb.onclick=function(){openModal({type:'expense'});};hd.appendChild(addb);scr.appendChild(hd);
+  const addb=document.createElement('button');addb.className='abtn';addb.textContent='+ Add';
+  // A chosen day is passed through so the new entry lands on that date.
+  addb.onclick=function(){openModal({type:'expense',date:S.expDate||''});};
+  hd.appendChild(addb);scr.appendChild(hd);
+
+  /* The stat row now follows the selection. It used to be hard-wired to
+     today, so picking another period left three figures on screen that had
+     nothing to do with the list underneath them. */
+  const selKey=S.expDate||dayKey(new Date());
+  const isToday=selKey===dayKey(new Date());
+  const dayExpAmt=S.expenses.filter(function(e){return dayKey(e.date)===selKey;}).reduce(function(a,e){return a+(+e.amount||0);},0);
+  const daySalesAmt=salesOnDay(selKey);
+  const dayNet=daySalesAmt-dayExpAmt;
+  const statLbl=isToday?'Today':new Date(selKey+'T00:00:00').toLocaleDateString('en-PH',{month:'short',day:'numeric'});
+
   const stats=document.createElement('div');stats.className='stats';
-  [{l:"Today's sales",v:fmt(todaySales()),c:'color:var(--st)'},{l:'Expenses',v:fmt(todayExpAmt),c:'color:var(--wt)'},{l:'Net profit',v:fmt(todayNet),c:todayNet>=0?'color:var(--st)':'color:var(--dt)'}].forEach(s=>{
-    const d=document.createElement('div');d.className='stat';d.innerHTML='<div class="stat-l">'+s.l+'</div><div class="stat-v" style="font-size:14px;'+s.c+'">'+s.v+'</div>';stats.appendChild(d);
+  [{l:statLbl+' sales',v:fmt(daySalesAmt),c:'color:var(--st)'},
+   {l:statLbl+' expenses',v:fmt(dayExpAmt),c:'color:var(--wt)'},
+   {l:'Net profit',v:fmt(dayNet),c:dayNet>=0?'color:var(--st)':'color:var(--dt)'}].forEach(function(s){
+    const d=document.createElement('div');d.className='stat';
+    d.innerHTML='<div class="stat-l">'+esc(s.l)+'</div><div class="stat-v" style="font-size:14px;'+s.c+'">'+s.v+'</div>';
+    stats.appendChild(d);
   });
   scr.appendChild(stats);
+
   const bar=document.createElement('div');bar.className='hist-bar';
-  [{id:'today',lbl:'Today'},{id:'week',lbl:'This week'},{id:'all',lbl:'All time'}].forEach(f=>{
-    const p=document.createElement('div');p.className='hpill'+(S.expFilter===f.id?' on':'');p.textContent=f.lbl;p.onclick=function(){S.expFilter=f.id;render();};bar.appendChild(p);
+  [{id:'today',lbl:'Today'},{id:'week',lbl:'This week'},{id:'month',lbl:'This month'},{id:'all',lbl:'All time'}].forEach(function(f){
+    const p=document.createElement('div');p.className='hpill'+((!S.expDate&&S.expFilter===f.id)?' on':'');p.textContent=f.lbl;
+    if(S.expDate)p.style.opacity='0.45';
+    p.onclick=function(){S.expFilter=f.id;S.expDate='';render();};
+    bar.appendChild(p);
   });
   scr.appendChild(bar);
-  const filtered=S.expenses.filter(e=>{
-    const d=new Date(e.date);if(S.expFilter==='today')return d.toDateString()===new Date().toDateString();
-    if(S.expFilter==='week'){const w=new Date();w.setDate(w.getDate()-7);return d>=w;}return true;
+
+  scr.appendChild(dayPickerRow(function(){return S.expDate;},function(v){S.expDate=v;}));
+
+  const filtered=S.expenses.filter(function(e){
+    const d=new Date(e.date);
+    if(S.expDate)return dayKey(d)===S.expDate;
+    if(S.expFilter==='today')return d.toDateString()===new Date().toDateString();
+    if(S.expFilter==='week'){const w=new Date();w.setDate(w.getDate()-7);return d>=w;}
+    if(S.expFilter==='month'){const m=new Date();m.setDate(m.getDate()-30);return d>=m;}
+    return true;
   }).slice().reverse();
+
+  // Total for everything currently listed, whatever the period.
+  const periodTot=filtered.reduce(function(a,e){return a+(+e.amount||0);},0);
+  const ptot=document.createElement('div');
+  ptot.style.cssText='display:flex;justify-content:space-between;align-items:center;margin:12px 14px 0;padding:11px 13px;border-radius:12px;background:var(--bg2);border:1px solid var(--b1)';
+  ptot.innerHTML='<span style="font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.4px">Total shown</span>'
+    +'<span style="font-size:16px;font-weight:800;color:var(--wt)">'+fmt(periodTot)+'</span>';
+  scr.appendChild(ptot);
+
+  /* Grouped by day with a running subtotal per day, which is what "total
+     daily" needs — a flat reversed list gave no way to read a day's spend. */
+  const byDay={};
+  filtered.forEach(function(e){
+    const k=dayKey(e.date);
+    if(!byDay[k])byDay[k]=[];
+    byDay[k].push(e);
+  });
+  const dayKeys=Object.keys(byDay).sort().reverse();
+
   const list=document.createElement('div');list.className='exp-list';
-  if(!filtered.length){const em=document.createElement('div');em.className='hist-empty';em.textContent='No expenses recorded.';list.appendChild(em);}
-  filtered.forEach(e=>{
-    const row=document.createElement('div');row.className='exp-row';
-    row.innerHTML='<div class="exp-dot"></div><div class="exp-info"><div class="exp-name">'+e.name+'</div><div class="exp-meta">'+(e.cat||'General')+' · '+new Date(e.date).toLocaleDateString('en-PH',{month:'short',day:'numeric'})+'</div></div><div class="exp-amt">'+fmt(e.amount)+'</div>';
-    const del=document.createElement('button');del.className='exp-del';del.innerHTML='&times;';del.onclick=function(){uiConfirm('Delete this expense?',function(__ok){if(!__ok)return;syncExpenseDeleteToCloud(e);S.expenses=S.expenses.filter(x=>x.id!==e.id);save();render();},{tone:'dang'});};
-    row.appendChild(del);list.appendChild(row);
+  if(!filtered.length){
+    const em=document.createElement('div');em.className='hist-empty';
+    em.textContent=S.expDate?'No expenses on this date.':'No expenses recorded.';
+    list.appendChild(em);
+  }
+
+  dayKeys.forEach(function(k){
+    const rows=byDay[k];
+    const dTot=rows.reduce(function(a,e){return a+(+e.amount||0);},0);
+    const tk=dayKey(new Date()),yk=dayKey(new Date(Date.now()-86400000));
+    const lbl=k===tk?'Today':k===yk?'Yesterday'
+      :new Date(k+'T00:00:00').toLocaleDateString('en-PH',{weekday:'short',month:'short',day:'numeric'});
+
+    const dh=document.createElement('div');
+    dh.style.cssText='display:flex;justify-content:space-between;align-items:baseline;padding:14px 2px 6px';
+    dh.innerHTML='<span style="font-size:13px;font-weight:800;color:var(--t1)">'+esc(lbl)+'</span>'
+      +'<span style="font-size:13px;font-weight:800;color:var(--wt)">'+fmt(dTot)+'</span>';
+    list.appendChild(dh);
+
+    const dsub=document.createElement('div');
+    dsub.style.cssText='font-size:11px;color:var(--t3);padding:0 2px 8px';
+    const daySales=salesOnDay(k);
+    dsub.textContent=rows.length+' entr'+(rows.length===1?'y':'ies')
+      +(daySales>0?' · sales '+fmt(daySales)+' · net '+fmt(daySales-dTot):'');
+    list.appendChild(dsub);
+
+    rows.forEach(function(e){
+      const row=document.createElement('div');row.className='exp-row';
+      row.innerHTML='<div class="exp-dot"></div><div class="exp-info"><div class="exp-name">'+esc(e.name)+'</div>'
+        +'<div class="exp-meta">'+esc(e.cat||'General')+' · '
+        +new Date(e.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div>'
+        +'<div class="exp-amt">'+fmt(e.amount)+'</div>';
+      const del=document.createElement('button');del.className='exp-del';del.innerHTML='&times;';
+      del.onclick=function(){
+        uiConfirm('Delete this expense?',function(__ok){
+          if(!__ok)return;
+          syncExpenseDeleteToCloud(e);
+          S.expenses=S.expenses.filter(function(x){return x.id!==e.id;});
+          save();render();
+        },{tone:'dang'});
+      };
+      row.appendChild(del);list.appendChild(row);
+    });
   });
   scr.appendChild(list);
 }
@@ -2983,11 +3559,19 @@ function renderTopNav(app){
   nsw.appendChild(ndot);nsw.appendChild(nlbl);brand.appendChild(nsw);
 
   if(S.activeCashier){
-    const cb=document.createElement('span');cb.className='cashier-badge';cb.textContent=S.activeCashier.name;cb.title='Tap to end shift';
-    cb.onclick=async function(){
-      uiConfirm('End shift for '+S.activeCashier.name+'?',function(__ok){if(!__ok)return;
-        S.activeCashier=null;S.shiftStart=null;save();render();
-      },{tone:'warn'});
+    const cb=document.createElement('span');cb.className='cashier-badge';cb.textContent=S.activeCashier.name;
+    cb.title='Tap to check out and count the drawer';
+    /* Ending a shift used to just null the cashier out, so the float was
+       never reconciled and a short drawer left no trace. It now goes through
+       the cash count. */
+    cb.onclick=function(){
+      if(S.openShift)openModal({type:'closeShift'});
+      else{
+        uiConfirm('End shift for '+S.activeCashier.name+'? No opening float was recorded, so the drawer cannot be reconciled.',function(__ok){
+          if(!__ok)return;
+          S.activeCashier=null;S.shiftStart=null;save();render();
+        },{tone:'warn'});
+      }
     };
     brand.appendChild(cb);
   }
@@ -3088,7 +3672,7 @@ function renderPOS(scr){
     card.onclick=function(){
       if(p.variants&&p.variants.length>0){openModal({type:'variantPick',prod:p});return;}
       const ex=S.cart.find(i=>i.id===p.id&&!i.variantLabel);
-      if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:effPrice,qty:1,note:'',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0});
+      if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0});
       render();toast(p.name+' added');
     };
     grid.appendChild(card);
@@ -3235,7 +3819,6 @@ function renderCart(scr){
   const pg=document.createElement('div');pg.className='pay-grid';
   [
     {id:'Cash',lbl:'CASH'},
-    {id:'Card',lbl:'CARD'},
     {id:'GCash',lbl:'GCASH'},
   ].forEach(pm=>{
     const btn=document.createElement('button');btn.className='pbtn';btn.textContent=pm.lbl;
@@ -3249,16 +3832,114 @@ function renderCart(scr){
   scr.appendChild(foot);
 }
 
+/* The drawer as it stands right now, plus the closed shifts behind it. Shown
+   above the clock-in list because it is the thing a supervisor checks most
+   often — and because attendance is gated behind cloud sign-in, whereas the
+   drawer works entirely offline. */
+function renderDrawerSection(scr){
+  const sh=S.openShift;
+
+  const hd=document.createElement('div');
+  hd.style.cssText='display:flex;align-items:center;justify-content:space-between;padding:14px 16px 8px';
+  const h3=document.createElement('div');
+  h3.style.cssText='font-size:13px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.4px';
+  h3.textContent='Cash drawer';
+  hd.appendChild(h3);
+  scr.appendChild(hd);
+
+  const wrap=document.createElement('div');wrap.style.cssText='padding:0 14px';
+
+  if(sh){
+    const bd=shiftSalesBreakdown(sh);
+    const paid=shiftPaidOut(sh);
+    const exp=expectedDrawer(sh,paid);
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg2);border:1.5px solid var(--st);border-radius:14px;padding:13px 14px';
+    const t=document.createElement('div');
+    t.style.cssText='font-size:14px;font-weight:800;color:var(--t1);margin-bottom:2px';
+    t.textContent=sh.cashier+' — on shift';
+    box.appendChild(t);
+    const st=document.createElement('div');
+    st.style.cssText='font-size:11.5px;color:var(--t3);margin-bottom:8px';
+    st.textContent='Since '+new Date(sh.startedAt).toLocaleString('en-PH',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+      +(sh.note?' · '+sh.note:'');
+    box.appendChild(st);
+    box.appendChild(drawerRow('Opening float',fmt(sh.openingFloat||0)));
+    box.appendChild(drawerRow('+ Cash sales ('+bd.count+' txn)',fmt(bd.cash),{color:'var(--st)'}));
+    if(paid>0)box.appendChild(drawerRow('− Cash paid out',fmt(paid),{color:'var(--wt)'}));
+    box.appendChild(drawerRow('Expected in drawer',fmt(exp),{big:true,rule:true,color:'var(--ac)'}));
+    if(bd.gcash>0||bd.credit>0){
+      const n=document.createElement('div');
+      n.style.cssText='font-size:11px;color:var(--t3);padding-top:7px;line-height:1.5';
+      n.textContent='Excludes '+fmt(bd.gcash+bd.credit)+' taken by GCash or credit — no notes changed hands.';
+      box.appendChild(n);
+    }
+    const cbtn=document.createElement('button');
+    cbtn.className='abtn';cbtn.style.cssText='width:100%;margin-top:11px;padding:13px;font-weight:700;border-radius:12px';
+    cbtn.textContent='Check out & count drawer';
+    cbtn.onclick=function(){openModal({type:'closeShift'});};
+    box.appendChild(cbtn);
+    wrap.appendChild(box);
+  } else {
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg2);border:1px solid var(--b1);border-radius:14px;padding:15px 14px;text-align:center';
+    box.innerHTML='<div style="font-size:13px;color:var(--t2);line-height:1.6">No shift is open. A cashier records their starting cash when they check in.</div>';
+    if(S.activeCashier){
+      const b2=document.createElement('button');
+      b2.className='abtn';b2.style.cssText='width:100%;margin-top:11px;padding:13px;font-weight:700;border-radius:12px';
+      b2.textContent='Record opening float for '+S.activeCashier.name;
+      b2.onclick=function(){openModal({type:'openShift',cashier:S.activeCashier});};
+      box.appendChild(b2);
+    }
+    wrap.appendChild(box);
+  }
+
+  // Closed shifts, newest first, capped so the tab stays scannable.
+  const log=(S.shiftLog||[]).slice().reverse();
+  if(log.length){
+    const lh=document.createElement('div');
+    lh.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin:16px 2px 8px';
+    lh.textContent='Recent shifts';
+    wrap.appendChild(lh);
+    log.slice(0,12).forEach(function(r){
+      const vl=varianceLabel(+r.variance||0,r);
+      const row=document.createElement('div');
+      row.style.cssText='background:var(--bg2);border:1px solid var(--b1);border-left:3px solid '+vl.color
+        +';border-radius:12px;padding:11px 13px;margin-bottom:8px;cursor:pointer';
+      row.innerHTML='<div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px">'
+        +'<span style="font-size:13.5px;font-weight:700;color:var(--t1)">'+esc(r.cashier||'—')+'</span>'
+        +'<span style="font-size:12.5px;font-weight:800;color:'+vl.color+'">'+esc(vl.text)+'</span></div>'
+        +'<div style="font-size:11px;color:var(--t3);margin-top:3px">'
+        +new Date(r.startedAt).toLocaleDateString('en-PH',{month:'short',day:'numeric'})+' · '
+        +new Date(r.startedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'–'
+        +(r.endedAt?new Date(r.endedAt).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'—')
+        +' · sales '+fmt(r.totalSales||0)
+        +(r.cloudSynced?'':' · local only')+'</div>';
+      row.onclick=function(){openModal({type:'shiftDetail',shift:r});};
+      wrap.appendChild(row);
+    });
+  }
+  scr.appendChild(wrap);
+}
+
 function renderAtt(scr){
   const hd=document.createElement('div');hd.className='panel-hd';
   hd.innerHTML='<h2>Attendance</h2>';
   scr.appendChild(hd);
 
+  // Drawer first: it works offline, unlike the employee list below.
+  renderDrawerSection(scr);
+
+  const ahd=document.createElement('div');
+  ahd.style.cssText='font-size:13px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.4px;padding:20px 16px 8px';
+  ahd.textContent='Clock in / out';
+  scr.appendChild(ahd);
+
   // Load cloud employees for this business
   const empList=S.cloudAttEmployees||[];
 
   if(!CLOUD.token||!CLOUD.bizId){
-    const msg=document.createElement('div');msg.style.cssText='padding:28px;text-align:center;color:var(--t3);font-size:14px';msg.textContent='Sign in to cloud to use attendance tracking.';scr.appendChild(msg);return;
+    const msg=document.createElement('div');msg.style.cssText='padding:8px 16px 28px;text-align:center;color:var(--t3);font-size:14px';msg.textContent='Sign in to cloud to use attendance tracking.';scr.appendChild(msg);return;
   }
 
   // Show current status of each employee
@@ -3380,6 +4061,24 @@ async function loadAttEmployees(){
     });
     // If the active cashier was deactivated in Supabase, end their shift now
     if(S.activeCashier&&S.activeCashier.supaId&&!allNames.includes(S.activeCashier.name)){
+      /* The drawer is deliberately NOT discarded. An open float that vanishes
+         because someone edited the employee list on the Dashboard would erase
+         the only record of what the cashier was holding, so the shift is
+         closed as unreconciled and kept for review. */
+      if(S.openShift){
+        const b=shiftSalesBreakdown(S.openShift);
+        const po=shiftPaidOut(S.openShift);
+        S.shiftLog.push(Object.assign({},S.openShift,{
+          endedAt:new Date().toISOString(),paidOut:po,
+          expected:Math.round(expectedDrawer(S.openShift,po)*100)/100,
+          countedCash:null,variance:0,unreconciled:true,
+          cashSales:b.cash,gcashSales:b.gcash,creditSales:b.credit,
+          otherSales:b.other,totalSales:b.total,txCount:b.count,
+          closeNote:'Cashier deactivated on the Dashboard — drawer never counted',
+          cloudSynced:false
+        }));
+        S.openShift=null;
+      }
       S.activeCashier=null;S.shiftStart=null;
     }
     save();
@@ -3495,6 +4194,35 @@ function renderPrep(scr){
     bar.appendChild(p);
   });
   scr.appendChild(bar);
+
+  /* Outstanding cloud writes are stated plainly. Before this the till gave a
+     cheerful "Recipe line added" and there was nowhere to find out that the
+     Dashboard had never received it. */
+  const pend=prepPendingCount();
+  if(pend>0){
+    const warn=document.createElement('div');
+    warn.style.cssText='margin:0 14px 10px;padding:11px 13px;border-radius:12px;background:var(--wg);border:1px solid var(--wt);display:flex;align-items:center;gap:10px;flex-wrap:wrap';
+    const wtxt=document.createElement('div');
+    wtxt.style.cssText='flex:1;min-width:150px;font-size:12.5px;color:var(--wt);font-weight:600;line-height:1.5';
+    wtxt.textContent=pend+' item'+(pend===1?'':'s')+' not yet on the Dashboard'
+      +(!navigator.onLine?' — device is offline'
+        :(!CLOUD.token||!CLOUD.bizId)?' — not signed in to cloud':'');
+    warn.appendChild(wtxt);
+    const rbtn=document.createElement('button');
+    rbtn.className='abtn';rbtn.style.cssText='font-size:12px;padding:8px 14px';
+    rbtn.textContent='Sync now';
+    rbtn.onclick=async function(){
+      if(!CLOUD.token||!CLOUD.bizId){toast('Sign in to the cloud from Admin first');return;}
+      if(!navigator.onLine){toast('Still offline — reconnect and try again');return;}
+      rbtn.disabled=true;rbtn.textContent='Syncing...';
+      const st=await retryPrepSync();
+      const left=prepPendingCount();
+      toast(left===0?'All prep data synced ✓':(st.ings+st.recipes)+' synced, '+left+' still pending');
+      render();
+    };
+    warn.appendChild(rbtn);
+    scr.appendChild(warn);
+  }
 
   if(onIng)renderPrepIngredients(scr);
   else renderPrepRecipes(scr);
@@ -3702,10 +4430,14 @@ function renderPrepRecipes(scr){
  * shown so the layout stays put between filters; credit and any legacy
  * tender only appear when there is something to report.
  * ==================================================================== */
+/* Card was withdrawn as a tender option. It is deliberately NOT listed here
+   any more, but it is not erased either: sales already taken on Card fall
+   through to the "unrecognised method" pass at the bottom of methodRows(),
+   so historic takings still appear and the totals still balance. Deleting it
+   outright would have quietly dropped that money out of every report. */
 const PAY_METHODS=[
   {id:'Cash', lbl:'Cash',  c:'var(--st)', always:true},
   {id:'GCash',lbl:'GCash', c:'var(--pt)', always:true},
-  {id:'Card', lbl:'Card',  c:'var(--ac)', always:true},
   {id:'Utang',lbl:'Credit',c:'var(--wt)', always:false, credit:true},
 ];
 
@@ -3782,9 +4514,110 @@ function dayPayLine(txs){
   return wrap;
 }
 
+/* ==================================================================== *
+ * CATEGORY BREAKDOWN
+ *
+ * Sale lines only ever stored name/qty/price, so the category has to be
+ * recovered from the product list for anything sold before this build.
+ * New sales now carry their own `cat` (see the checkout handlers), which
+ * keeps the figures right even after a product is renamed or retired.
+ * ==================================================================== */
+function catOfSaleItem(it){
+  if(it&&it.cat)return it.cat;
+  const p=(S.prods||[]).filter(function(x){return x.name===(it&&it.name);})[0];
+  return (p&&p.cat)||'Uncategorised';
+}
+
+// {cat:{qty,total}} for a set of sales. Voided sales took no money.
+function tallyByCategory(txs){
+  const map={};
+  (txs||[]).forEach(function(s){
+    if(s.voided)return;
+    (s.items||[]).forEach(function(it){
+      const c=catOfSaleItem(it);
+      if(!map[c])map[c]={qty:0,total:0};
+      map[c].qty+=(+it.qty||0);
+      map[c].total+=(+it.price||0)*(+it.qty||0);
+    });
+  });
+  return map;
+}
+
+/* Builds the "Sales by category" panel. `title` lets the same builder serve
+   both the period summary and the smaller per-day block. */
+function catBreakdownBox(txs,title){
+  const map=tallyByCategory(txs);
+  const rows=Object.entries(map).sort(function(a,b){return b[1].total-a[1].total;});
+  if(!rows.length)return null;
+  const box=document.createElement('div');
+  box.style.cssText='background:var(--bg2);border:1px solid var(--b1);border-radius:12px;padding:10px 12px;margin-bottom:12px';
+  const hd=document.createElement('div');
+  hd.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:8px;display:flex;justify-content:space-between';
+  hd.innerHTML='<span>'+esc(title||'Sales by category')+'</span>'
+    +'<span style="display:grid;grid-template-columns:36px 90px;gap:4px;text-align:center"><span>Qty</span><span style="text-align:right">Total</span></span>';
+  box.appendChild(hd);
+  const grand=rows.reduce(function(a,r){return a+r[1].total;},0);
+  rows.forEach(function(e){
+    const name=e[0],d=e[1];
+    const pct=grand>0?Math.round(d.total/grand*100):0;
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--b1);font-size:13px';
+    row.innerHTML='<span style="color:var(--t1);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(name)
+      +' <span style="color:var(--t3);font-weight:600;font-size:11px">'+pct+'%</span></span>'
+      +'<span style="display:grid;grid-template-columns:36px 90px;gap:4px;text-align:center;flex-shrink:0">'
+      +'<span style="color:var(--t2);font-weight:700;text-align:center">'+d.qty+'</span>'
+      +'<span style="color:var(--ac);font-weight:700;text-align:right">'+fmt(d.total)+'</span></span>';
+    box.appendChild(row);
+  });
+  const totRow=document.createElement('div');
+  totRow.style.cssText='display:flex;justify-content:space-between;padding:6px 0 0;font-size:13px;font-weight:800';
+  const totQty=rows.reduce(function(a,r){return a+r[1].qty;},0);
+  totRow.innerHTML='<span style="color:var(--t1)">Total ('+rows.length+' categor'+(rows.length===1?'y':'ies')+')</span>'
+    +'<span style="display:grid;grid-template-columns:36px 90px;gap:4px;flex-shrink:0">'
+    +'<span style="color:var(--t2);font-weight:800;text-align:center">'+totQty+'</span>'
+    +'<span style="color:var(--ac);font-weight:800;text-align:right">'+fmt(grand)+'</span></span>';
+  box.appendChild(totRow);
+  return box;
+}
+
+/* A date input plus a Clear button, shared by History and Expenses. Picking a
+   day overrides the range pills; clearing it hands control back to them. */
+function dayPickerRow(getVal,setVal){
+  const wrap=document.createElement('div');
+  wrap.style.cssText='display:flex;gap:8px;align-items:center;padding:10px 14px;border-bottom:1px solid var(--b1);flex-shrink:0;flex-wrap:wrap';
+  const lbl=document.createElement('label');
+  lbl.style.cssText='font-size:11px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.4px';
+  lbl.textContent='Pick a date';
+  const inp=document.createElement('input');
+  inp.type='date';
+  inp.value=getVal()||'';
+  // Future days hold nothing, so they are not offerable.
+  inp.max=new Date(Date.now()-new Date().getTimezoneOffset()*60000).toISOString().slice(0,10);
+  inp.style.cssText='flex:1;min-width:140px;padding:9px 11px;border-radius:10px;border:1.5px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:14px;outline:none';
+  inp.onchange=function(){setVal(inp.value||'');render();};
+  lbl.setAttribute('for','dayPick');inp.id='dayPick';
+  wrap.appendChild(lbl);wrap.appendChild(inp);
+  if(getVal()){
+    const clr=document.createElement('button');
+    clr.className='abtn';clr.style.cssText='font-size:12px;padding:8px 14px';
+    clr.textContent='Clear';
+    clr.onclick=function(){setVal('');render();};
+    wrap.appendChild(clr);
+  }
+  return wrap;
+}
+
+// A local YYYY-MM-DD key. toISOString() would shift the day across UTC.
+function dayKey(d){
+  const x=new Date(d);
+  return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');
+}
+
 function renderHist(scr){
   const filt=S.sales.filter(s=>{
     const d=new Date(s.date);
+    // An explicit date beats the range pills.
+    if(S.histDate)return dayKey(d)===S.histDate;
     if(S.histFilter==='today')return d.toDateString()===new Date().toDateString();
     if(S.histFilter==='week'){const w=new Date();w.setDate(w.getDate()-7);return d>=w;}
     if(S.histFilter==='month'){const m=new Date();m.setDate(m.getDate()-30);return d>=m;}
@@ -3802,13 +4635,38 @@ function renderHist(scr){
 
   const bar=document.createElement('div');bar.className='hist-bar';
   [{id:'all',lbl:'All time'},{id:'today',lbl:'Today'},{id:'week',lbl:'This week'},{id:'month',lbl:'This month'}].forEach(f=>{
-    const p=document.createElement('div');p.className='hpill'+(S.histFilter===f.id?' on':'');p.textContent=f.lbl;
-    p.onclick=function(){S.histFilter=f.id;render();};
+    // Greyed out while a specific date is active, so it is obvious which
+    // control is actually driving the list.
+    const p=document.createElement('div');p.className='hpill'+((!S.histDate&&S.histFilter===f.id)?' on':'');p.textContent=f.lbl;
+    if(S.histDate)p.style.opacity='0.45';
+    p.onclick=function(){S.histFilter=f.id;S.histDate='';render();};
     bar.appendChild(p);
   });
   scr.appendChild(bar);
 
+  scr.appendChild(dayPickerRow(function(){return S.histDate;},function(v){S.histDate=v;}));
+
+  if(S.histDate){
+    const note=document.createElement('div');
+    note.style.cssText='padding:8px 16px;font-size:12px;color:var(--t3);font-weight:600';
+    note.textContent='Showing '+new Date(S.histDate+'T00:00:00').toLocaleDateString('en-PH',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
+    scr.appendChild(note);
+  }
+
   renderPaySummary(scr,filt);
+
+  /* Category totals for whatever period is on screen. Wrapped in the same
+     padding as the lists below so it lines up with them. */
+  const catWrap=document.createElement('div');catWrap.style.cssText='padding:0 14px';
+  const catBox=catBreakdownBox(filt,'Sales by category');
+  if(catBox)catWrap.appendChild(catBox);
+  else{
+    const em=document.createElement('div');
+    em.style.cssText='padding:10px 2px 14px;font-size:12.5px;color:var(--t3)';
+    em.textContent='No category sales in this period.';
+    catWrap.appendChild(em);
+  }
+  scr.appendChild(catWrap);
 
   const byDay={};
   filt.slice().reverse().forEach(s=>{const k=new Date(s.date).toDateString();if(!byDay[k])byDay[k]=[];byDay[k].push(s);});
@@ -3825,10 +4683,19 @@ function renderHist(scr){
     if(dayPay)list.appendChild(dayPay);
     txs.forEach(s=>{
       const card=document.createElement('div');card.className='txcard'+(s.voided?' voided':'');
-      card.innerHTML='<div class="txl"><div class="txid">'+s.id+(s.cashier?' · '+s.cashier:'')+'</div><div class="txitems">'+s.items.map(i=>i.name+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+(s.voided?'Voided':s.method)+'">'+(s.voided?'VOID':s.method)+'</div></div>';
+      /* The method lands in a class attribute as well as in text. Stripped to
+         letters and digits for the class — a method containing a quote would
+         otherwise break out of the attribute — and escaped for the label. */
+      const mRaw=s.voided?'Voided':(s.method||'Cash');
+      const mCls=String(mRaw).replace(/[^A-Za-z0-9]/g,'');
+      card.innerHTML='<div class="txl"><div class="txid">'+esc(s.id)+(s.cashier?' · '+esc(s.cashier):'')+'</div><div class="txitems">'+s.items.map(i=>esc(i.name)+' x'+i.qty).join(', ')+'</div><div class="txtime">'+new Date(s.date).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})+'</div></div><div class="txr"><div class="txtot">'+fmt(s.total)+'</div><div class="txm m'+mCls+'">'+esc(s.voided?'VOID':mRaw)+'</div></div>';
       card.onclick=function(){openModal({type:'viewtx',tx:s});};
       list.appendChild(card);
     });
+    // Per-day category totals, sitting above the item-level detail.
+    const dayCat=catBreakdownBox(txs,'Category totals · '+lbl);
+    if(dayCat)list.appendChild(dayCat);
+
     // Items sold breakdown for this day
     const validTxs=txs.filter(s=>!s.voided);
     if(validTxs.length>0){
@@ -3848,7 +4715,7 @@ function renderHist(scr){
       sorted.forEach(([name,d])=>{
         const row=document.createElement('div');
         row.style.cssText='display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--b1);font-size:13px';
-        row.innerHTML='<span style="color:var(--t1);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+name+'</span>'
+        row.innerHTML='<span style="color:var(--t1);font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(name)+'</span>'
           +'<span style="display:grid;grid-template-columns:36px 90px;gap:4px;text-align:center;flex-shrink:0">'
           +'<span style="color:var(--t2);font-weight:700;text-align:center">'+d.qty+'</span>'
           +'<span style="color:var(--ac);font-weight:700;text-align:right">'+fmt(d.total)+'</span></span>';
@@ -4042,7 +4909,35 @@ function renderAdmin(scr){
     const cr=document.createElement('div');cr.style.cssText='display:flex;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid var(--b1)';
     cr.innerHTML='<div style="flex:1;font-size:14px;font-weight:600">'+c.name+'</div>';
     const del=document.createElement('button');del.className='abtn';del.style.cssText='padding:6px 12px;font-size:12px;color:var(--dt)';del.textContent='Remove';
-    del.onclick=function(){uiConfirm('Remove '+c.name+'?',function(__ok){if(!__ok)return;S.cashiers=S.cashiers.filter(x=>x.id!==c.id);if(S.activeCashier&&S.activeCashier.id===c.id){S.activeCashier=null;S.shiftStart=null;}save();saveSettingsToCloud();render();},{tone:'dang'});};
+    del.onclick=function(){
+      // Deleting a cashier mid-shift would strand an uncounted drawer.
+      const hasOpen=S.openShift&&S.activeCashier&&S.activeCashier.id===c.id;
+      const q=hasOpen
+        ?'Remove '+c.name+'? Their drawer is still open and has not been counted — check them out first if you want a short/over figure.'
+        :'Remove '+c.name+'?';
+      uiConfirm(q,function(__ok){
+        if(!__ok)return;
+        S.cashiers=S.cashiers.filter(x=>x.id!==c.id);
+        if(S.activeCashier&&S.activeCashier.id===c.id){
+          if(S.openShift){
+            const b=shiftSalesBreakdown(S.openShift);
+            const po=shiftPaidOut(S.openShift);
+            S.shiftLog.push(Object.assign({},S.openShift,{
+              endedAt:new Date().toISOString(),paidOut:po,
+              expected:Math.round(expectedDrawer(S.openShift,po)*100)/100,
+              countedCash:null,variance:0,unreconciled:true,
+              cashSales:b.cash,gcashSales:b.gcash,creditSales:b.credit,
+              otherSales:b.other,totalSales:b.total,txCount:b.count,
+              closeNote:'Cashier removed before the drawer was counted',
+              cloudSynced:false
+            }));
+            S.openShift=null;
+          }
+          S.activeCashier=null;S.shiftStart=null;
+        }
+        save();saveSettingsToCloud();render();
+      },{tone:'dang'});
+    };
     cr.appendChild(del);secCash.appendChild(cr);
   });
   const addCRow=document.createElement('div');addCRow.style.cssText='display:flex;gap:8px';
@@ -4220,7 +5115,7 @@ function renderAdmin(scr){
     localStorage.removeItem('arroyo_cloud');
     localStorage.removeItem('arroyo_sync_queue');
     CLOUD={user:null,token:null,bizId:null};
-    S={screen:'biz',biz:null,bizName:'',prods:[],cats:[],cart:[],cat:'All',search:'',disc:0,discType:'%',pass:'1234',locked:true,nid:10,sales:[],salesTotal:0,modal:null,histFilter:'all',cashTendered:0,themeColor:'#111110',cartOpen:false,cashiers:[],cashierNid:1,activeCashier:null,shiftStart:null,alertDismissed:false,cloudEmail:'',cloudBizName:'',authScreen:'login',selectedCustomer:null,chargeToUtang:false,cloudCustomers:[],cloudAttEmployees:[],expenses:[],expenseNid:1,expFilter:'today',dailyGoal:0,requireRef:false,bizLogo:null};
+    S={screen:'biz',biz:null,bizName:'',prods:[],cats:[],cart:[],cat:'All',search:'',disc:0,discType:'%',pass:'1234',locked:true,nid:10,sales:[],salesTotal:0,modal:null,histFilter:'all',cashTendered:0,themeColor:'#111110',cartOpen:false,cashiers:[],cashierNid:1,activeCashier:null,shiftStart:null,openShift:null,shiftLog:[],shiftNid:1,histDate:'',expDate:'',ings:[],ingNid:1,recipes:[],recipeNid:1,prepTab:'ing',prepSearch:'',ingFilter:'all',stockLocked:true,alertDismissed:false,cloudEmail:'',cloudBizName:'',authScreen:'login',selectedCustomer:null,chargeToUtang:false,cloudCustomers:[],cloudAttEmployees:[],expenses:[],expenseNid:1,expFilter:'today',dailyGoal:0,requireRef:false,bizLogo:null};
     applyPrefill();applyTheme(S.themeColor);
     render();
   },{tone:'dang'});},{tone:'dang'});};
@@ -4589,13 +5484,13 @@ function renderModal(app){
         if(S.cashTendered<tot()&&!S.chargeToUtang)return;
         const txid=txId();
         const payMethod=S.chargeToUtang?'Utang':'Cash';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||''})),total:tot(),disc:damt(),method:payMethod,receipt:receiptStr(payMethod,txid),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:''};
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i)})),total:tot(),disc:damt(),method:payMethod,receipt:receiptStr(payMethod,txid),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:''};
         S.cart.forEach(ci=>{applyStockDelta(ci,-ci.qty);});
         const cartCopy=[...S.cart];
         const capturedCash=S.cashTendered;
         if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled){tx.queueNo=S.pendingQueueNo||0;tx.queueStatus='waiting';tx.queueDay=(function(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');})();}S.sales.push(tx);S.salesTotal+=tot();S.cart=[];S.disc=0;S.discType='%';S.cashTendered=0;S.cartOpen=false;S.pendingQueueNo=0;if(typeof __qzBadge==='function')__qzBadge();
         S.selectedCustomer=null;S.chargeToUtang=false;
-        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy,-1);
+        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy,-1);pushProductStock(cartCopy);
         closeModal();
         toast('Sale recorded - '+txid);
         openModal({type:'receiptReady',tx:tx,cashTendered:capturedCash});
@@ -4639,12 +5534,12 @@ function renderModal(app){
           toast('Please enter reference number');return;
         }
         const txid=txId();const refNum=refInp?refInp.value.trim():'';
-        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||''})),total:tot(),disc:damt(),method:m.method,ref:refNum,receipt:receiptStr(m.method,txid,refNum),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:''};
+        const tx={id:txid,date:new Date().toISOString(),items:S.cart.map(i=>({name:i.name,qty:i.qty,price:i.price,variantLabel:i.variantLabel||'',cat:i.cat||catOfSaleItem(i)})),total:tot(),disc:damt(),method:m.method,ref:refNum,receipt:receiptStr(m.method,txid,refNum),customer:S.selectedCustomer?S.selectedCustomer.name:'',cashier:S.activeCashier?S.activeCashier.name:''};
         S.cart.forEach(ci=>{applyStockDelta(ci,-ci.qty);});
         const cartCopy2=[...S.cart];
         if(typeof QUEUE_CFG!=='undefined'&&QUEUE_CFG.enabled){tx.queueNo=S.pendingQueueNo||0;tx.queueStatus='waiting';tx.queueDay=(function(){var d=new Date();return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');})();}S.sales.push(tx);S.salesTotal+=tot();S.cart=[];S.disc=0;S.discType="%";S.cashTendered=0;S.cartOpen=false;S.pendingQueueNo=0;if(typeof __qzBadge==='function')__qzBadge();
         S.selectedCustomer=null;S.chargeToUtang=false;
-        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy2,-1);
+        save();syncSaleToCloud(tx);recordCustomerSale(tx);consumeIngredients(cartCopy2,-1);pushProductStock(cartCopy2);
         closeModal();
         toast('Sale recorded - '+txid);
         openModal({type:'receiptReady',tx:tx,cashTendered:0});
@@ -4733,6 +5628,9 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
           // Put the recipe ingredients back too, or a voided sale would
           // permanently lose the stock it consumed.
           consumeIngredients(tx.items,1);
+          // And send the restored product stock up, or the Dashboard keeps
+          // showing the reduced figure from the original sale.
+          pushProductStock(tx.items);
         }
         save();
         // Sync void to cloud — queues if offline
@@ -4776,7 +5674,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       chip.innerHTML='<div>'+v.label+'</div><div style="font-size:11px;color:var(--t3);margin-top:3px">'+fmt(v.price!==undefined?v.price:p.price)+' · '+(v.stock===999?'unlimited':v.stock+' left')+'</div>';
       if(!isOut){chip.onclick=function(){
         const ex=S.cart.find(i=>i.id===p.id&&i.variantLabel===v.label);
-        if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:v.price!==undefined?v.price:p.price,qty:1,variantLabel:v.label,note:''});
+        if(ex)ex.qty++;else S.cart.push({id:p.id,name:p.name,price:v.price!==undefined?v.price:p.price,qty:1,variantLabel:v.label,note:'',cat:p.cat||'Uncategorised'});
         closeModal();toast(p.name+' ('+v.label+') added');
       };}
       chips.appendChild(chip);
@@ -4866,14 +5764,16 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       const num=function(id){const v=parseFloat(document.getElementById(id).value);return isNaN(v)||v<0?0:ingRound(v);};
       const un=(document.getElementById('iUn').value||'').trim();
       if(isNew){
-        const ing={id:S.ingNid++,cloudId:null,name:nm,unit:un,stock:num('iSt'),low:num('iLo'),cost:num('iCo')};
-        S.ings.push(ing);save();saveIngToCloud(ing);
+        const ing={id:S.ingNid++,cloudId:null,name:nm,unit:un,stock:num('iSt'),low:num('iLo'),cost:num('iCo'),syncDirty:true};
+        S.ings.push(ing);save();
         closeModal();toast(nm+' added');
+        syncIngNow(ing,true);
       } else {
         const t=ingById(ii.id);
         if(t){
           t.name=nm;t.unit=un;t.stock=num('iSt');t.low=num('iLo');t.cost=num('iCo');
-          save();saveIngToCloud(t);
+          markIngDirty(t);save();
+          syncIngNow(t,true);
         }
         closeModal();toast('Saved');
       }
@@ -4944,7 +5844,7 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const ok=document.createElement('button');ok.className='mpri';ok.textContent='Save stock';
     ok.onclick=function(){
       const t=ingById(m.ingId);
-      if(t){t.stock=val;save();saveIngToCloud(t);}
+      if(t){t.stock=val;markIngDirty(t);save();syncIngNow(t,true);}
       closeModal();toast(ing.name+' set to '+ingQtyStr(val,ing.unit));
     };
     btns.appendChild(cancel);btns.appendChild(ok);body.appendChild(btns);
@@ -5028,13 +5928,18 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
       }
       const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
       const ok=document.createElement('button');ok.className='mpri';ok.textContent=isNew?'Add':'Save';
-      ok.onclick=function(){
+      ok.onclick=async function(){
         const prod=psel.value;
         const ingId=parseInt(gsel.value);
         const qty=parseFloat(qin.value);
         if(!prod){toast('Choose a product');return;}
         if(!ingById(ingId)){toast('Choose an ingredient');return;}
         if(isNaN(qty)||qty<=0){toast('Enter how much is used per sale');return;}
+        /* The button is held disabled for the round-trip. The old handler
+           returned immediately and let the cloud write race in the
+           background, so a second tap could create a duplicate line and a
+           failure was never reported. */
+        ok.disabled=true;ok.style.opacity='0.6';ok.textContent='Saving...';
         // One line per product/ingredient pair — fold a duplicate into the
         // existing line instead of creating a second one that also deducts.
         const dupe=S.recipes.filter(function(x){
@@ -5049,18 +5954,23 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
             S.recipes=S.recipes.filter(function(x){return x.id!==rr.id;});
             if(stale)delRecipeFromCloud(stale);
           }
-          save();saveRecipeToCloud(dupe);
+          markRecipeDirty(dupe);save();
           closeModal();toast('Recipe updated');
+          await syncRecipeNow(dupe);
           return;
         }
         if(isNew){
-          const r={id:S.recipeNid++,cloudId:null,prod:prod,ingId:ingId,qty:ingRound(qty)};
-          S.recipes.push(r);save();saveRecipeToCloud(r);
+          const r={id:S.recipeNid++,cloudId:null,prod:prod,ingId:ingId,qty:ingRound(qty),syncDirty:true};
+          S.recipes.push(r);save();
           closeModal();toast('Recipe line added');
+          await syncRecipeNow(r);
         } else {
           const t=S.recipes.filter(function(x){return x.id===rr.id;})[0];
-          if(t){t.prod=prod;t.ingId=ingId;t.qty=ingRound(qty);save();saveRecipeToCloud(t);}
-          closeModal();toast('Saved');
+          if(t){
+            t.prod=prod;t.ingId=ingId;t.qty=ingRound(qty);markRecipeDirty(t);save();
+            closeModal();toast('Saved');
+            await syncRecipeNow(t);
+          } else {closeModal();}
         }
       };
       btns.appendChild(cancel);btns.appendChild(ok);body.appendChild(btns);
@@ -5076,17 +5986,275 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     const mfCat2=document.createElement('div');mfCat2.className='mf';mfCat2.innerHTML='<label>Category</label>';
     const catSel=document.createElement('select');catSel.id='eCat';
     ['Utilities','Supplies','Rent','Salary','Logistics','Maintenance','Other'].forEach(c=>{const o=document.createElement('option');o.value=c;o.textContent=c;catSel.appendChild(o);});
-    mfCat2.appendChild(catSel);grid.appendChild(mfCat2);body.appendChild(grid);
+    mfCat2.appendChild(catSel);grid.appendChild(mfCat2);
+
+    /* A date of its own. Expenses were always stamped with the moment the
+       form was submitted, so a receipt entered the morning after landed on
+       the wrong day and quietly skewed that day's net profit. */
+    const mfDt=document.createElement('div');mfDt.className='mf';mfDt.innerHTML='<label>Date</label>';
+    const dtIn=document.createElement('input');dtIn.id='eDt';dtIn.type='date';
+    dtIn.max=dayKey(new Date());
+    dtIn.value=(m&&m.date)?m.date:dayKey(new Date());
+    mfDt.appendChild(dtIn);
+    const dtHint=document.createElement('div');
+    dtHint.style.cssText='font-size:11.5px;color:var(--t3)';
+    dtHint.textContent='Defaults to today. Change it to record an earlier expense.';
+    mfDt.appendChild(dtHint);
+    grid.appendChild(mfDt);
+    body.appendChild(grid);
+
     const btns=document.createElement('div');btns.className='mbtns';
     const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
     const save2=document.createElement('button');save2.className='mpri';save2.textContent='Add';
     save2.onclick=function(){
       const nm=document.getElementById('eNm').value.trim(),am=parseFloat(document.getElementById('eAm').value)||0,cat=document.getElementById('eCat').value;
       if(!nm){toast('Enter a description');return;}if(am<=0){toast('Enter a valid amount');return;}
-      S.expenses.push({id:S.expenseNid++,name:nm,amount:am,cat,date:new Date().toISOString()});
+      const dv=(document.getElementById('eDt')||{}).value||'';
+      /* Today keeps the real clock time so the ordering within a day stays
+         meaningful; a back-dated entry is stamped at midday on that date so
+         it cannot slide into a neighbouring day in any timezone. */
+      let iso;
+      if(!dv||dv===dayKey(new Date()))iso=new Date().toISOString();
+      else iso=new Date(dv+'T12:00:00').toISOString();
+      S.expenses.push({id:S.expenseNid++,name:nm,amount:am,cat,date:iso});
       save();syncExpenseToCloud(S.expenses[S.expenses.length-1]);closeModal();toast('Expense added');
     };
     btns.appendChild(cancel);btns.appendChild(save2);body.appendChild(btns);
+
+  } else if(m.type==='shiftDetail'){
+    const r=m.shift||{};
+    const vl=varianceLabel(+r.variance||0,r);
+    body.innerHTML='<div class="mbadge">Shift record</div><div class="mtitle">'+esc(r.cashier||'Shift')+'</div>';
+    const meta=document.createElement('div');
+    meta.style.cssText='font-size:12px;color:var(--t3);line-height:1.6;margin-bottom:10px';
+    meta.textContent=new Date(r.startedAt).toLocaleString('en-PH',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})
+      +' → '+(r.endedAt?new Date(r.endedAt).toLocaleString('en-PH',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—');
+    body.appendChild(meta);
+
+    const v1=document.createElement('div');
+    v1.style.cssText='padding:13px;border-radius:12px;text-align:center;background:var(--bg2);border:1.5px solid '+vl.color+';margin-bottom:12px';
+    v1.innerHTML='<div style="font-size:19px;font-weight:800;color:'+vl.color+'">'+esc(vl.text)+'</div>';
+    body.appendChild(v1);
+
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px';
+    box.appendChild(drawerRow('Opening float',fmt(r.openingFloat||0)));
+    box.appendChild(drawerRow('+ Cash sales',fmt(r.cashSales||0),{color:'var(--st)'}));
+    box.appendChild(drawerRow('− Cash paid out',fmt(r.paidOut||0),{color:(r.paidOut>0)?'var(--wt)':'var(--t2)'}));
+    box.appendChild(drawerRow('Expected cash',fmt(r.expected||0),{rule:true,color:'var(--ac)'}));
+    const notCounted=r.unreconciled||r.countedCash===null||r.countedCash===undefined;
+    box.appendChild(drawerRow('Counted cash',notCounted?'Not counted':fmt(r.countedCash||0),
+      notCounted?{color:'var(--t3)'}:{}));
+    box.appendChild(drawerRow('Difference',notCounted?'—':fmt(r.variance||0),{big:true,rule:true,color:vl.color}));
+    body.appendChild(box);
+
+    const box2=document.createElement('div');
+    box2.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px;margin-top:10px';
+    const b2h=document.createElement('div');
+    b2h.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px';
+    b2h.textContent='Sales this shift · '+(r.txCount||0)+' transaction'+((r.txCount||0)===1?'':'s');
+    box2.appendChild(b2h);
+    box2.appendChild(drawerRow('Cash',fmt(r.cashSales||0),{color:'var(--st)'}));
+    if(r.gcashSales>0)box2.appendChild(drawerRow('GCash',fmt(r.gcashSales),{color:'var(--pt)'}));
+    if(r.creditSales>0)box2.appendChild(drawerRow('Credit',fmt(r.creditSales),{color:'var(--wt)'}));
+    if(r.otherSales>0)box2.appendChild(drawerRow('Other',fmt(r.otherSales),{color:'var(--t2)'}));
+    box2.appendChild(drawerRow('Total sales',fmt(r.totalSales||0),{big:true,rule:true,color:'var(--ac)'}));
+    body.appendChild(box2);
+
+    if(r.note||r.closeNote){
+      const nb=document.createElement('div');
+      nb.style.cssText='margin-top:10px;font-size:12.5px;color:var(--t2);line-height:1.6';
+      nb.textContent=[r.note?'Open: '+r.note:'',r.closeNote?'Close: '+r.closeNote:''].filter(Boolean).join(' · ');
+      body.appendChild(nb);
+    }
+    if(!r.cloudSynced){
+      const sn=document.createElement('div');
+      sn.style.cssText='margin-top:10px;font-size:11.5px;color:var(--t3);line-height:1.5';
+      sn.textContent='Held on this device only. It will be retried the next time the cloud is reachable.';
+      body.appendChild(sn);
+    }
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cl=document.createElement('button');cl.className='mpri';cl.textContent='Close';cl.onclick=closeModal;
+    btns.appendChild(cl);body.appendChild(btns);
+
+  } else if(m.type==='openShift'){
+    /* Start of shift: count the float. Nothing else happens until this is
+       entered, so every shift has a baseline to reconcile against. */
+    const c=m.cashier||S.activeCashier||{name:'Cashier'};
+    body.innerHTML='<div class="mbadge">Check in</div><div class="mtitle">Starting cash on hand</div>'
+      +'<p style="font-size:13.5px;color:var(--t2);line-height:1.6">Count the money in the drawer now, '
+      +esc(c.name)+'. This is your float — the end-of-shift check measures the drawer against it.</p>';
+    const mf=document.createElement('div');mf.className='mf';
+    mf.innerHTML='<label>Cash on hand (PHP)</label>';
+    const fi=document.createElement('input');fi.id='sfFloat';fi.type='number';fi.min='0';fi.step='any';
+    fi.inputMode='decimal';fi.placeholder='0.00';
+    mf.appendChild(fi);
+    const fh=document.createElement('div');fh.style.cssText='font-size:11.5px;color:var(--t3);line-height:1.5';
+    fh.textContent='Enter 0 if you are starting with an empty drawer.';
+    mf.appendChild(fh);body.appendChild(mf);
+
+    const nf=document.createElement('div');nf.className='mf';nf.style.marginTop='12px';
+    nf.innerHTML='<label>Note (optional)</label>';
+    const ni=document.createElement('input');ni.id='sfNote';ni.type='text';ni.placeholder='e.g. handed over by Ana';
+    nf.appendChild(ni);body.appendChild(nf);
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+    const go=document.createElement('button');go.className='mpri';go.textContent='Start shift';
+    go.onclick=function(){
+      const raw=(document.getElementById('sfFloat')||{}).value;
+      const v=parseFloat(raw);
+      // An empty box is a genuine mistake, distinct from a deliberate zero.
+      if(raw===''||raw===undefined||isNaN(v)||v<0){toast('Enter the cash you are starting with (0 is allowed)');return;}
+      const now=new Date().toISOString();
+      S.openShift={
+        id:S.shiftNid++,cashier:c.name,cashierId:c.id!==undefined?c.id:null,
+        supaId:c.supaId||null,startedAt:now,openingFloat:Math.round(v*100)/100,
+        note:((document.getElementById('sfNote')||{}).value||'').trim(),endedAt:null
+      };
+      S.activeCashier=c;S.shiftStart=now;S.alertDismissed=false;
+      save();closeModal();
+      toast('Shift started · float '+fmt(v));
+      render();
+    };
+    fi.onkeydown=function(e){if(e.key==='Enter')go.onclick();};
+    btns.appendChild(cancel);btns.appendChild(go);body.appendChild(btns);
+    setTimeout(function(){try{document.getElementById('sfFloat').focus();}catch(e){}},100);
+
+  } else if(m.type==='closeShift'){
+    /* End of shift: the sales for the shift are shown beside the drawer maths
+       so the counted cash can be lined up against what was actually sold. */
+    const sh=S.openShift;
+    if(!sh){body.innerHTML='<div class="mtitle">No open shift</div>';
+      const b2=document.createElement('div');b2.className='mbtns';
+      const ok2=document.createElement('button');ok2.className='mpri';ok2.textContent='Close';ok2.onclick=closeModal;
+      b2.appendChild(ok2);body.appendChild(b2);
+    } else {
+    const bd=shiftSalesBreakdown(sh);
+    const autoPaid=shiftPaidOut(sh);
+    body.innerHTML='<div class="mbadge">Check out</div><div class="mtitle">Count the drawer</div>';
+
+    const meta=document.createElement('div');
+    meta.style.cssText='font-size:12px;color:var(--t3);line-height:1.6;margin-bottom:4px';
+    meta.textContent=sh.cashier+' · started '+new Date(sh.startedAt).toLocaleString('en-PH',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+    body.appendChild(meta);
+
+    // Sales for the shift, so the drawer can be read against the takings.
+    const sales=document.createElement('div');
+    sales.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px;margin:8px 0';
+    const sHd=document.createElement('div');
+    sHd.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px';
+    sHd.textContent='Sales this shift · '+bd.count+' transaction'+(bd.count===1?'':'s');
+    sales.appendChild(sHd);
+    sales.appendChild(drawerRow('Cash',fmt(bd.cash),{color:'var(--st)'}));
+    if(bd.gcash>0)sales.appendChild(drawerRow('GCash (not in drawer)',fmt(bd.gcash),{color:'var(--pt)'}));
+    if(bd.credit>0)sales.appendChild(drawerRow('Credit (not in drawer)',fmt(bd.credit),{color:'var(--wt)'}));
+    if(bd.other>0)sales.appendChild(drawerRow('Other (not in drawer)',fmt(bd.other),{color:'var(--t2)'}));
+    sales.appendChild(drawerRow('Total sales',fmt(bd.total),{big:true,rule:true,color:'var(--ac)'}));
+    if(bd.voided>0){
+      const vn=document.createElement('div');
+      vn.style.cssText='font-size:11px;color:var(--t3);padding-top:6px';
+      vn.textContent=bd.voided+' voided sale'+(bd.voided===1?'':'s')+' excluded.';
+      sales.appendChild(vn);
+    }
+    body.appendChild(sales);
+
+    // Paid out is editable: not every expense is settled from the drawer.
+    const pf=document.createElement('div');pf.className='mf';pf.style.marginTop='4px';
+    pf.innerHTML='<label>Cash paid out of drawer (PHP)</label>';
+    const pi=document.createElement('input');pi.id='csPaid';pi.type='number';pi.min='0';pi.step='any';
+    pi.inputMode='decimal';pi.value=autoPaid?String(Math.round(autoPaid*100)/100):'0';
+    pf.appendChild(pi);
+    const ph=document.createElement('div');ph.style.cssText='font-size:11.5px;color:var(--t3);line-height:1.5';
+    ph.textContent=autoPaid>0
+      ?'Pre-filled from '+fmt(autoPaid)+' of expenses logged during this shift. Adjust if any were not paid from the drawer.'
+      :'Leave at 0 if nothing was paid out of the drawer.';
+    pf.appendChild(ph);body.appendChild(pf);
+
+    // Expected cash, recomputed live as the two inputs change.
+    const calc=document.createElement('div');
+    calc.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px;margin:12px 0';
+    body.appendChild(calc);
+
+    const cf=document.createElement('div');cf.className='mf';
+    cf.innerHTML='<label>Counted cash on hand now (PHP)</label>';
+    const ci=document.createElement('input');ci.id='csCount';ci.type='number';ci.min='0';ci.step='any';
+    ci.inputMode='decimal';ci.placeholder='0.00';
+    cf.appendChild(ci);body.appendChild(cf);
+
+    const verdict=document.createElement('div');
+    verdict.style.cssText='margin-top:12px;padding:13px;border-radius:12px;text-align:center';
+    body.appendChild(verdict);
+
+    const nf2=document.createElement('div');nf2.className='mf';nf2.style.marginTop='12px';
+    nf2.innerHTML='<label>Note (optional)</label>';
+    const ni2=document.createElement('input');ni2.id='csNote';ni2.type='text';ni2.placeholder='e.g. 20 short, checked twice';
+    nf2.appendChild(ni2);body.appendChild(nf2);
+
+    const repaint=function(){
+      const paid=parseFloat(pi.value)||0;
+      const exp=expectedDrawer(sh,paid);
+      calc.innerHTML='';
+      const ch=document.createElement('div');
+      ch.style.cssText='font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px';
+      ch.textContent='What the drawer should hold';
+      calc.appendChild(ch);
+      calc.appendChild(drawerRow('Opening float',fmt(sh.openingFloat||0)));
+      calc.appendChild(drawerRow('+ Cash sales',fmt(bd.cash),{color:'var(--st)'}));
+      calc.appendChild(drawerRow('− Cash paid out',fmt(paid),{color:paid>0?'var(--wt)':'var(--t2)'}));
+      calc.appendChild(drawerRow('Expected cash',fmt(exp),{big:true,rule:true,color:'var(--ac)'}));
+
+      const raw=ci.value;
+      if(raw===''||raw===undefined||isNaN(parseFloat(raw))){
+        verdict.style.background='var(--bg2)';verdict.style.border='1px solid var(--b1)';
+        verdict.innerHTML='<div style="font-size:12.5px;color:var(--t3)">Enter the counted cash to see short or over.</div>';
+        return;
+      }
+      const counted=parseFloat(raw);
+      const v=Math.round((counted-exp)*100)/100;
+      const vl=varianceLabel(v);
+      verdict.style.background='var(--bg2)';verdict.style.border='1.5px solid '+vl.color;
+      verdict.innerHTML='<div style="font-size:19px;font-weight:800;color:'+vl.color+'">'+esc(vl.text)+'</div>'
+        +'<div style="font-size:11.5px;color:var(--t3);margin-top:4px;line-height:1.5">'+esc(vl.detail)+'</div>';
+    };
+    pi.oninput=repaint;ci.oninput=repaint;repaint();
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cancel=document.createElement('button');cancel.textContent='Back';cancel.onclick=closeModal;
+    const fin=document.createElement('button');fin.className='mpri';fin.textContent='End shift';
+    fin.onclick=function(){
+      const raw=ci.value;
+      if(raw===''||isNaN(parseFloat(raw))||parseFloat(raw)<0){toast('Enter the counted cash on hand');return;}
+      const paid=parseFloat(pi.value)||0;
+      const counted=Math.round(parseFloat(raw)*100)/100;
+      const exp=Math.round(expectedDrawer(sh,paid)*100)/100;
+      const v=Math.round((counted-exp)*100)/100;
+      const vl=varianceLabel(v);
+      const finish=function(){
+        const rec=Object.assign({},sh,{
+          endedAt:new Date().toISOString(),paidOut:paid,expected:exp,
+          countedCash:counted,variance:v,
+          cashSales:bd.cash,gcashSales:bd.gcash,creditSales:bd.credit,
+          otherSales:bd.other,totalSales:bd.total,txCount:bd.count,
+          closeNote:((document.getElementById('csNote')||{}).value||'').trim(),
+          cloudSynced:false
+        });
+        S.shiftLog.push(rec);
+        S.openShift=null;S.activeCashier=null;S.shiftStart=null;
+        save();closeModal();
+        toast('Shift closed · '+vl.text);
+        render();
+        pushShiftToCloud(rec);
+      };
+      /* A discrepancy is confirmed out loud rather than slipping past, but it
+         is never blocked — the count is what it is. */
+      if(Math.abs(v)>=0.005){
+        uiConfirm(vl.text+'. Record the shift with this discrepancy?',function(__ok){if(__ok)finish();},{tone:'warn'});
+      } else finish();
+    };
+    btns.appendChild(cancel);btns.appendChild(fin);body.appendChild(btns);
+    setTimeout(function(){try{document.getElementById('csCount').focus();}catch(e){}},100);
+    }
 
   } else if(m.type==='creatorAuth'){
     body.innerHTML='<div class="mbadge">Creator access required</div><div class="mtitle">Change business type</div><p style="font-size:14px;color:var(--t2);line-height:1.6">Enter the creator password to continue.</p>';
@@ -5284,14 +6452,27 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     });
     const totalAmt=filtered.reduce(function(a,s){return a+s.total;},0);
     const cashAmt=filtered.filter(function(s){return s.method==='Cash';}).reduce(function(a,s){return a+s.total;},0);
-    const cardAmt=filtered.filter(function(s){return s.method==='Card';}).reduce(function(a,s){return a+s.total;},0);
     const gcashAmt=filtered.filter(function(s){return s.method==='GCash';}).reduce(function(a,s){return a+s.total;},0);
+    const utangAmt=filtered.filter(function(s){return s.method==='Utang';}).reduce(function(a,s){return a+s.total;},0);
+    /* Card is no longer offered, so its tile is only built when the period
+       actually contains Card sales — otherwise the report would carry a
+       permanent PHP 0.00 line for a tender nobody can take. */
+    const cardAmt=filtered.filter(function(s){return s.method==='Card';}).reduce(function(a,s){return a+s.total;},0);
 
     const titleEl=document.createElement('div');titleEl.className='mtitle';titleEl.textContent='Sales Report - '+label;body.appendChild(titleEl);
 
     // Summary cards
     const sumGrid=document.createElement('div');sumGrid.style.cssText='display:grid;grid-template-columns:1fr 1fr;gap:8px';
-    [{l:'Total sales',v:filtered.length+' txns',big:false},{l:'Total revenue',v:fmt(totalAmt),big:true},{l:'Cash',v:fmt(cashAmt),big:false},{l:'Card',v:fmt(cardAmt),big:false},{l:'GCash',v:fmt(gcashAmt),big:false},{l:'Avg sale',v:filtered.length?fmt(totalAmt/filtered.length):fmt(0),big:false}].forEach(function(s){
+    const rptTiles=[
+      {l:'Total sales',v:filtered.length+' txns',big:false},
+      {l:'Total revenue',v:fmt(totalAmt),big:true},
+      {l:'Cash',v:fmt(cashAmt),big:false},
+      {l:'GCash',v:fmt(gcashAmt),big:false}
+    ];
+    if(utangAmt>0)rptTiles.push({l:'Credit',v:fmt(utangAmt),big:false});
+    if(cardAmt>0)rptTiles.push({l:'Card (legacy)',v:fmt(cardAmt),big:false});
+    rptTiles.push({l:'Avg sale',v:filtered.length?fmt(totalAmt/filtered.length):fmt(0),big:false});
+    rptTiles.forEach(function(s){
       const box=document.createElement('div');box.style.cssText='background:var(--bg0);border-radius:12px;padding:12px';
       box.innerHTML='<div style="font-size:10px;font-weight:700;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px">'+s.l+'</div><div style="font-size:'+(s.big?'20':'16')+'px;font-weight:800;color:'+(s.big?'var(--ac)':'var(--t1)')+'">'+s.v+'</div>';
       sumGrid.appendChild(box);
@@ -5539,7 +6720,39 @@ window.addEventListener('online',async function(){
     const authed=await ensureAuth();
     if(authed){await loadCloudData(true);render();toast('Synced ✓');}
   }
+  /* Ingredients and recipe lines written while offline sit outside the sales
+     queue, so they need their own nudge here or they would wait until the
+     next manual full sync. */
+  const ps=await retryPrepSync();
+  if(ps&&(ps.ings||ps.recipes)){render();toast('Synced '+(ps.ings+ps.recipes)+' prep item(s)');}
+  await retryShiftSync();
 });
+
+/* Closed shifts that never reached the cloud are pushed again here. Kept
+   separate from the sales queue so a missing `shifts` table can never block
+   sales from syncing. */
+async function retryShiftSync(){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return 0;
+  const pend=(S.shiftLog||[]).filter(function(r){return !r.cloudSynced;});
+  let n=0;
+  for(let i=0;i<pend.length;i++){
+    const ok=await pushShiftToCloud(pend[i]);
+    if(ok)n++;
+  }
+  if(n)render();
+  return n;
+}
+
+/* Slow safety net: anything still outstanding is retried in the background
+   so a recipe never silently stays local. Quiet unless it clears something. */
+setInterval(async function(){
+  if(!CLOUD.token||!CLOUD.bizId||!navigator.onLine)return;
+  if(prepPendingCount()>0){
+    const ps=await retryPrepSync();
+    if(ps&&(ps.ings||ps.recipes))render();
+  }
+  if((S.shiftLog||[]).some(function(r){return !r.cloudSynced;}))await retryShiftSync();
+},60000);
 
 // ── BARCODE SCANNER INPUT ────────────────────────────────────
 // USB / Bluetooth scanners act as keyboards: they type the code
@@ -5557,7 +6770,7 @@ function scanAddToCart(p){
   const effPrice=(p.salePct>0)?+(p.price*(1-p.salePct/100)).toFixed(2):p.price;
   const ex=S.cart.find(function(i){return i.id===p.id&&!i.variantLabel;});
   if(ex)ex.qty++;
-  else S.cart.push({id:p.id,name:p.name,price:effPrice,qty:1,note:'',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0});
+  else S.cart.push({id:p.id,name:p.name,price:effPrice,qty:1,note:'',cat:p.cat||'Uncategorised',origPrice:p.salePct>0?p.price:null,salePct:p.salePct||0});
   render();toast('\u2713 '+p.name+' \u00b7 scanned');
 }
 document.addEventListener('keydown',function(e){
