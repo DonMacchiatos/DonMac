@@ -1234,6 +1234,75 @@ async function syncExpenseDeleteToCloud(exp){
     if(!r.ok)queueAdd('expenseDel',{filter:filter});
   }catch(e){queueAdd('expenseDel',{filter:filter});}
 }
+/* ==================================================================== *
+ * DELETE A DAY'S SALES
+ *
+ * Built for clearing out test data. Deliberately day-scoped and password
+ * gated: the existing "Clear sales data" button wipes S.sales locally but
+ * never touches the cloud, so everything it deleted came straight back on
+ * the next pull. These delete the cloud rows too.
+ *
+ * Boundaries are worked out from the local day, not from a UTC slice of the
+ * timestamp — at GMT+9 an evening sale carries a UTC date of the following
+ * day, so a naive `date=like.2026-08-28*` filter would delete the wrong
+ * transactions and miss the ones actually on screen.
+ * ==================================================================== */
+function dayBounds(key){
+  const parts=String(key||'').split('-');
+  const y=+parts[0],mo=+parts[1]-1,d=+parts[2];
+  const start=new Date(y,mo,d,0,0,0,0);
+  const end=new Date(y,mo,d+1,0,0,0,0);
+  return {startISO:start.toISOString(),endISO:end.toISOString()};
+}
+
+async function deleteSalesForDayFromCloud(key){
+  if(!CLOUD.token||!CLOUD.bizId)return {ok:false,msg:'not signed in'};
+  if(!navigator.onLine)return {ok:false,msg:'device is offline'};
+  const b=dayBounds(key);
+  const filter='biz_id=eq.'+CLOUD.bizId
+    +'&date=gte.'+encodeURIComponent(b.startISO)
+    +'&date=lt.'+encodeURIComponent(b.endISO);
+  try{
+    const r=await fetch(SUPA_URL+'/rest/v1/sales?'+filter,{method:'DELETE',headers:cloudHeaders()});
+    if(!r.ok){
+      let t='';try{t=await r.text();}catch(e){}
+      return {ok:false,status:r.status,msg:(t||'delete rejected').slice(0,160)};
+    }
+    return {ok:true};
+  }catch(e){return {ok:false,msg:(e&&e.message)||'network error'};}
+}
+
+async function deleteExpensesForDayFromCloud(key){
+  if(!CLOUD.token||!CLOUD.bizId)return {ok:false,msg:'not signed in'};
+  if(!navigator.onLine)return {ok:false,msg:'device is offline'};
+  const b=dayBounds(key);
+  const filter='biz_id=eq.'+CLOUD.bizId
+    +'&date=gte.'+encodeURIComponent(b.startISO)
+    +'&date=lt.'+encodeURIComponent(b.endISO);
+  try{
+    const r=await fetch(SUPA_URL+'/rest/v1/expenses?'+filter,{method:'DELETE',headers:cloudHeaders()});
+    if(!r.ok){
+      let t='';try{t=await r.text();}catch(e){}
+      return {ok:false,status:r.status,msg:(t||'delete rejected').slice(0,160)};
+    }
+    return {ok:true};
+  }catch(e){return {ok:false,msg:(e&&e.message)||'network error'};}
+}
+
+// What a given day holds, so the confirmation can state it plainly.
+function daySummaryFor(key){
+  const sales=(S.sales||[]).filter(function(s){return dayKey(s.date)===key;});
+  const exps=(S.expenses||[]).filter(function(e){return dayKey(e.date)===key;});
+  const live=sales.filter(function(s){return !s.voided;});
+  return {
+    sales:sales, expenses:exps,
+    count:sales.length, voided:sales.length-live.length,
+    total:live.reduce(function(a,s){return a+(+s.total||0);},0),
+    expTotal:exps.reduce(function(a,e){return a+(+e.amount||0);},0),
+    items:live.reduce(function(a,s){return a+(s.items||[]).reduce(function(x,i){return x+(+i.qty||0);},0);},0)
+  };
+}
+
 async function syncVoidToCloud(txnId,voidedBy,voidedAt){
   if(!CLOUD.token||!CLOUD.bizId){
     queueAdd('void',{txn_id:txnId,voided_by:voidedBy||'',voided_at:voidedAt||new Date().toISOString()});return;
@@ -4708,10 +4777,23 @@ function renderHist(scr){
   scr.appendChild(dayPickerRow(function(){return S.histDate;},function(v){S.histDate=v;}));
 
   if(S.histDate){
+    const noteRow=document.createElement('div');
+    noteRow.style.cssText='display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 16px;flex-wrap:wrap';
     const note=document.createElement('div');
-    note.style.cssText='padding:8px 16px;font-size:12px;color:var(--t3);font-weight:600';
+    note.style.cssText='font-size:12px;color:var(--t3);font-weight:600;flex:1;min-width:150px';
     note.textContent='Showing '+new Date(S.histDate+'T00:00:00').toLocaleDateString('en-PH',{weekday:'long',year:'numeric',month:'long',day:'numeric'});
-    scr.appendChild(note);
+    noteRow.appendChild(note);
+    /* Only offered once a single date is in view, so there is no way to fire
+       it at a range by accident. The modal still asks for the password. */
+    if(filt.length>0){
+      const dbtn=document.createElement('button');
+      dbtn.className='abtn';
+      dbtn.style.cssText='font-size:12px;padding:8px 13px;color:var(--dt)';
+      dbtn.textContent='Delete this date';
+      dbtn.onclick=function(){openModal({type:'deleteDaySales',date:S.histDate});};
+      noteRow.appendChild(dbtn);
+    }
+    scr.appendChild(noteRow);
   }
 
   renderPaySummary(scr,filt);
@@ -5116,7 +5198,45 @@ function renderAdmin(scr){
   const clrSalesRow=document.createElement('div');clrSalesRow.className='abtnrow';
   const clrSalesBtn=document.createElement('button');clrSalesBtn.className='abtn';clrSalesBtn.textContent='Clear sales data';
   clrSalesBtn.onclick=function(){uiConfirm('Clear all sales data?',function(__ok){if(!__ok)return;S.sales=[];S.salesTotal=0;save();render();toast('Cleared');},{tone:'dang'});};
-  clrSalesRow.appendChild(clrSalesBtn);sec3.appendChild(clrSalesRow);scroll.appendChild(sec3);
+  clrSalesRow.appendChild(clrSalesBtn);sec3.appendChild(clrSalesRow);
+
+  /* Delete one day at a time — the tool for clearing out test data without
+     touching real trading days. */
+  const delDayWrap=document.createElement('div');
+  delDayWrap.style.cssText='border-top:1px solid var(--b1);padding-top:12px;display:flex;flex-direction:column;gap:8px';
+  const ddLbl=document.createElement('div');
+  ddLbl.style.cssText='font-size:12px;font-weight:600;color:var(--t2)';
+  ddLbl.textContent='Delete sales for one date';
+  delDayWrap.appendChild(ddLbl);
+  const ddRow=document.createElement('div');ddRow.style.cssText='display:flex;align-items:center;gap:8px';
+  const ddInp=document.createElement('input');ddInp.type='date';ddInp.id='delSalesDate';
+  ddInp.value=S.histDate||dayKey(new Date());
+  ddInp.max=dayKey(new Date());
+  ddInp.style.cssText='flex:1;padding:11px 12px;border-radius:10px;border:1.5px solid var(--b2);background:var(--bg1);color:var(--t1);font-size:14px;outline:none';
+  const ddBtn=document.createElement('button');ddBtn.className='abtn';ddBtn.style.color='var(--dt)';ddBtn.textContent='Delete';
+  ddBtn.onclick=function(){
+    const v=(document.getElementById('delSalesDate')||{}).value;
+    if(!v){toast('Pick a date first');return;}
+    openModal({type:'deleteDaySales',date:v});
+  };
+  ddRow.appendChild(ddInp);ddRow.appendChild(ddBtn);delDayWrap.appendChild(ddRow);
+  // Live count for the chosen date, so the button is never a blind press.
+  const ddInfo=document.createElement('div');
+  ddInfo.style.cssText='font-size:11.5px;color:var(--t3);line-height:1.5';
+  const paintDD=function(){
+    const v=ddInp.value;
+    if(!v){ddInfo.textContent='';return;}
+    const s=daySummaryFor(v);
+    ddInfo.textContent=s.count===0
+      ?'No sales recorded on this date.'
+      :s.count+' transaction'+(s.count===1?'':'s')+' · '+fmt(s.total)
+        +(s.expenses.length?' · '+s.expenses.length+' expense entr'+(s.expenses.length===1?'y':'ies'):'');
+  };
+  ddInp.onchange=paintDD;paintDD();
+  delDayWrap.appendChild(ddInfo);
+  sec3.appendChild(delDayWrap);
+
+  scroll.appendChild(sec3);
 
   // Daily Sales Report
   const secReport=document.createElement('div');secReport.className='asec';
@@ -6400,6 +6520,131 @@ uiPrompt('Stock will be restored. Enter the admin password to authorise.',
     };
     btns.appendChild(cancel);btns.appendChild(fin);body.appendChild(btns);
     setTimeout(function(){try{document.getElementById('csCount').focus();}catch(e){}},100);
+    }
+
+  } else if(m.type==='deleteDaySales'){
+    /* Irreversible, so the modal states exactly what will go before asking
+       for the admin password — same bar as a void, which is a far smaller
+       action than this. */
+    const key=m.date||dayKey(new Date());
+    const sum=daySummaryFor(key);
+    const nice=new Date(key+'T00:00:00').toLocaleDateString('en-PH',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
+
+    body.innerHTML='<div class="mbadge" style="color:var(--dt)">Cannot be undone</div>'
+      +'<div class="mtitle">Delete sales for this date</div>';
+
+    const dl=document.createElement('div');
+    dl.style.cssText='font-size:13.5px;font-weight:700;color:var(--t1);margin-bottom:8px';
+    dl.textContent=nice;
+    body.appendChild(dl);
+
+    if(sum.count===0){
+      const em=document.createElement('div');
+      em.style.cssText='font-size:13px;color:var(--t3);line-height:1.6';
+      em.textContent='There are no sales recorded on this date, so there is nothing to delete.';
+      body.appendChild(em);
+      const b0=document.createElement('div');b0.className='mbtns';
+      const c0=document.createElement('button');c0.className='mpri';c0.textContent='Close';c0.onclick=closeModal;
+      b0.appendChild(c0);body.appendChild(b0);
+    } else {
+    const box=document.createElement('div');
+    box.style.cssText='background:var(--bg0);border:1px solid var(--b1);border-radius:12px;padding:11px 13px';
+    box.appendChild(drawerRow('Transactions',String(sum.count)));
+    if(sum.voided>0)box.appendChild(drawerRow('of which voided',String(sum.voided),{color:'var(--t3)'}));
+    box.appendChild(drawerRow('Items sold',String(sum.items)));
+    box.appendChild(drawerRow('Revenue removed',fmt(sum.total),{big:true,rule:true,color:'var(--dt)'}));
+    if(sum.expenses.length>0)
+      box.appendChild(drawerRow('Expenses that day',sum.expenses.length+' · '+fmt(sum.expTotal),{color:'var(--t3)'}));
+    body.appendChild(box);
+
+    // Optional extras, both off by default so the action does only what it says.
+    const opts=document.createElement('div');
+    opts.style.cssText='display:flex;flex-direction:column;gap:9px;margin-top:12px';
+
+    const mkCheck=function(id,label,hint){
+      const w=document.createElement('label');
+      w.style.cssText='display:flex;gap:9px;align-items:flex-start;cursor:pointer';
+      const cb=document.createElement('input');cb.type='checkbox';cb.id=id;
+      cb.style.cssText='margin-top:2px;width:17px;height:17px;flex-shrink:0;accent-color:var(--ac)';
+      const tw=document.createElement('div');
+      tw.innerHTML='<div style="font-size:13px;font-weight:600;color:var(--t1)">'+esc(label)+'</div>'
+        +'<div style="font-size:11.5px;color:var(--t3);line-height:1.5">'+esc(hint)+'</div>';
+      w.appendChild(cb);w.appendChild(tw);
+      return w;
+    };
+    opts.appendChild(mkCheck('dsStock','Put the stock back',
+      'Returns the products and recipe ingredients these sales consumed. Leave off if you have already corrected stock by hand, or it will be added twice.'));
+    if(sum.expenses.length>0)
+      opts.appendChild(mkCheck('dsExp','Also delete that day\u2019s expenses',
+        sum.expenses.length+' expense entr'+(sum.expenses.length===1?'y':'ies')+' totalling '+fmt(sum.expTotal)+'.'));
+    body.appendChild(opts);
+
+    const pf=document.createElement('div');pf.className='mf';pf.style.marginTop='12px';
+    pf.innerHTML='<label>Admin password</label>';
+    const pi=document.createElement('input');pi.id='dsPw';pi.type='password';pi.placeholder='Admin password';
+    pf.appendChild(pi);
+    const perr=document.createElement('div');perr.style.cssText='font-size:12.5px;color:var(--dt);min-height:17px';
+    pf.appendChild(perr);body.appendChild(pf);
+
+    const cloudNote=document.createElement('div');
+    cloudNote.style.cssText='font-size:11.5px;color:var(--t3);line-height:1.6';
+    cloudNote.textContent=(!CLOUD.token||!CLOUD.bizId)
+      ?'Not signed in to the cloud — this removes the sales from this device only. If a signed-in device still holds them they will come back on the next sync.'
+      :(!navigator.onLine
+        ?'This device is offline. The sales cannot be removed from the cloud yet, so they may return on the next sync. Reconnect and repeat this to clear the cloud copy.'
+        :'The cloud copy for this date will be deleted too, so the sales will not come back on the next sync.');
+    body.appendChild(cloudNote);
+
+    const btns=document.createElement('div');btns.className='mbtns';
+    const cancel=document.createElement('button');cancel.textContent='Cancel';cancel.onclick=closeModal;
+    const del=document.createElement('button');del.className='mpri';del.style.background='var(--df)';
+    del.textContent='Delete '+sum.count+' sale'+(sum.count===1?'':'s');
+    del.onclick=async function(){
+      if(pi.value!==S.pass){perr.textContent='Incorrect admin password.';pi.value='';pi.focus();return;}
+      perr.textContent='';
+      const restock=!!(document.getElementById('dsStock')||{}).checked;
+      const alsoExp=!!(document.getElementById('dsExp')||{}).checked;
+      del.disabled=true;del.style.opacity='0.6';del.textContent='Deleting...';
+
+      /* Stock first, while the sales are still in hand. A voided sale already
+         had its stock returned when it was voided, so returning it again here
+         would inflate inventory — only live sales are unwound. */
+      if(restock){
+        sum.sales.filter(function(s){return !s.voided;}).forEach(function(s){
+          (s.items||[]).forEach(function(it){applyStockDelta(it,it.qty);});
+          consumeIngredients(s.items||[],1);
+        });
+      }
+
+      const ids={};sum.sales.forEach(function(s){ids[s.id]=true;});
+      S.sales=(S.sales||[]).filter(function(s){return !ids[s.id];});
+      S.salesTotal=(S.sales||[]).filter(function(s){return !s.voided;})
+        .reduce(function(a,s){return a+(+s.total||0);},0);
+
+      if(alsoExp){
+        const eids={};sum.expenses.forEach(function(e){eids[e.id]=true;});
+        S.expenses=(S.expenses||[]).filter(function(e){return !eids[e.id];});
+      }
+      save();
+
+      let cloudMsg='';
+      if(CLOUD.token&&CLOUD.bizId&&navigator.onLine){
+        const r=await deleteSalesForDayFromCloud(key);
+        if(!r.ok)cloudMsg=' Cloud delete failed: '+(r.msg||'unknown')+'.';
+        if(alsoExp){
+          const r2=await deleteExpensesForDayFromCloud(key);
+          if(!r2.ok)cloudMsg+=' Cloud expense delete failed.';
+        }
+      } else cloudMsg=' Cloud copy untouched.';
+
+      if(restock)pushProductStock(sum.sales.reduce(function(a,s){return a.concat(s.items||[]);},[]));
+      closeModal();
+      toast('Deleted '+sum.count+' sale'+(sum.count===1?'':'s')+' for '+key+'.'+cloudMsg);
+      render();
+    };
+    pi.onkeydown=function(e){if(e.key==='Enter')del.onclick();};
+    btns.appendChild(cancel);btns.appendChild(del);body.appendChild(btns);
+    setTimeout(function(){try{document.getElementById('dsPw').focus();}catch(e){}},100);
     }
 
   } else if(m.type==='creatorAuth'){
