@@ -115,7 +115,16 @@ html,body{min-height:100%;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI
 .b-gray{background:var(--bg3);color:var(--t3);border:1px solid var(--b1)}
 .b-purple{background:rgba(163,113,247,0.12);color:var(--pt);border:1px solid rgba(163,113,247,0.2)}
 .filter-bar{display:flex;gap:6px;margin-bottom:18px;flex-wrap:wrap}
-.fp{padding:6px 14px;border-radius:6px;border:1px solid var(--b2);background:transparent;color:var(--t2);font-size:12px;font-weight:500;cursor:pointer;transition:all .15s}
+.fp{padding:6px 14px;border-radius:6px;border:1px solid var(--b2);background:transparent;color:var(--t2);font-size:12px;font-weight:500;cursor:pointer;transition:all .15s;font-family:inherit}
+.date-range{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:4px 10px;border-radius:6px;border:1px solid var(--b2);background:var(--bg1)}
+.dr-lbl{font-size:12px;color:var(--t2);font-weight:500}
+.dr-in{padding:5px 8px;border-radius:5px;border:1px solid var(--b2);background:var(--bg2);color:var(--t1);font-size:12px;font-family:inherit;outline:none;transition:border-color .15s}
+.dr-in:focus-visible{border-color:var(--ac);box-shadow:0 0 0 3px rgba(47,129,247,0.15)}
+.dr-in::-webkit-calendar-picker-indicator{filter:invert(0.7);cursor:pointer}
+.dr-clear{padding:5px 10px;border-radius:5px;border:1px solid transparent;background:none;color:var(--t2);font-size:12px;font-weight:500;font-family:inherit;cursor:pointer}
+.dr-clear:hover{color:var(--t1);border-color:var(--b2)}
+.fp:focus-visible,.dr-clear:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
+@media(max-width:640px){.date-range{width:100%}.dr-in{flex:1;min-width:0}}
 .fp:hover{color:var(--t1);border-color:var(--t3)}
 .fp.on{background:var(--ac);color:#fff;border-color:var(--ac)}
 .loading{display:flex;align-items:center;justify-content:center;height:200px;color:var(--t3);font-size:14px;gap:12px}
@@ -289,7 +298,7 @@ if(typeof DASH_PREFILL!=='undefined'){
   }
 })();
 let D={sales:[],expenses:[],products:[],employees:[],attendance:[],customers:[],credit:[],suppliers:[],pos:[],ingredients:[],recipes:[],wastage:[],orders:[],loans:[],leaves:[],shifts:[]};
-let UI={page:'overview',filter:'week',modal:null,loading:false};
+let UI={page:'overview',filter:'week',from:'',to:'',modal:null,loading:false};
 let CHARTS={};
 
 function el(tag,cls,html){const e=document.createElement(tag);if(cls)e.className=cls;if(html!==undefined)e.innerHTML=html;return e;}
@@ -449,26 +458,56 @@ async function saveSettingsToCloud(patch){
   }catch(e){}
 }
 
-function filteredSales(){
+/* iso() formats a Date for an <input type="date"> value. Built from the local
+   getters rather than toISOString(), which shifts to UTC and lands on the
+   previous day for any PH-morning timestamp. */
+function iso(d){
+  const p=function(n){return String(n).padStart(2,'0');};
+  return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate());
+}
+
+/* Single source of truth for "is this record inside the selected period?".
+   Every page used to carry its own copy of this if-chain, so adding a period
+   meant editing six places and any one of them left behind kept showing the
+   old range. */
+function inFilter(dateVal){
+  if(!dateVal)return false;
+  const d=new Date(dateVal);
+  if(isNaN(d.getTime()))return false;
+  if(UI.filter==='custom'){
+    // A blank end of the range means open-ended on that side.
+    if(UI.from&&d<new Date(UI.from+'T00:00:00'))return false;
+    if(UI.to&&d>new Date(UI.to+'T23:59:59.999'))return false;
+    return true;
+  }
   const now=new Date();
+  if(UI.filter==='today')return d.toDateString()===now.toDateString();
+  if(UI.filter==='week'){const w=new Date(now);w.setDate(w.getDate()-7);return d>=w;}
+  if(UI.filter==='month'){const m=new Date(now);m.setDate(m.getDate()-30);return d>=m;}
+  return true;
+}
+
+/* Human-readable name for the active period, used in card headers and on the
+   payslip. Reading UI.filter straight out printed "custom" with no dates. */
+function filterLabel(){
+  if(UI.filter==='custom'){
+    if(UI.from&&UI.to)return fd(UI.from)+' – '+fd(UI.to);
+    if(UI.from)return 'from '+fd(UI.from);
+    if(UI.to)return 'up to '+fd(UI.to);
+    return 'custom range';
+  }
+  const names={today:'today',week:'this week',month:'this month',all:'all time'};
+  return names[UI.filter]||UI.filter;
+}
+
+function filteredSales(){
   return D.sales.filter(function(s){
     if(s.voided)return false;
-    const d=new Date(s.date);
-    if(UI.filter==='today')return d.toDateString()===now.toDateString();
-    if(UI.filter==='week'){const w=new Date(now);w.setDate(w.getDate()-7);return d>=w;}
-    if(UI.filter==='month'){const m=new Date(now);m.setDate(m.getDate()-30);return d>=m;}
-    return true;
+    return inFilter(s.date);
   });
 }
 function filteredExp(){
-  const now=new Date();
-  return D.expenses.filter(function(e){
-    const d=new Date(e.date);
-    if(UI.filter==='today')return d.toDateString()===now.toDateString();
-    if(UI.filter==='week'){const w=new Date(now);w.setDate(w.getDate()-7);return d>=w;}
-    if(UI.filter==='month'){const m=new Date(now);m.setDate(m.getDate()-30);return d>=m;}
-    return true;
-  });
+  return D.expenses.filter(function(e){return inFilter(e.date);});
 }
 function topProds(){
   const map={};
@@ -481,23 +520,71 @@ function topProds(){
   return Object.values(map).sort(function(a,b){return b.rev-a.rev;}).slice(0,8);
 }
 function salesByDay(){
+  /* Keyed by ISO date so the bars sort chronologically and two different
+     months never collide on the same "Mar 3" label. The old version keyed on
+     the display string and inherited whatever order D.sales happened to be
+     in, which showed up as out-of-order bars on any range over a month. */
   const map={};
   filteredSales().forEach(function(s){
-    const k=new Date(s.date).toLocaleDateString('en-PH',{month:'short',day:'numeric'});
-    map[k]=(map[k]||0)+s.total;
+    const dt=new Date(s.date);
+    if(isNaN(dt.getTime()))return;
+    const k=iso(dt);
+    if(!map[k])map[k]={lbl:dt.toLocaleDateString('en-PH',{month:'short',day:'numeric'}),v:0};
+    map[k].v+=s.total;
   });
-  const days=Object.keys(map);
-  return{labels:days,data:days.map(function(k){return map[k];})};
+  const keys=Object.keys(map).sort();
+  return{labels:keys.map(function(k){return map[k].lbl;}),data:keys.map(function(k){return map[k].v;})};
 }
 function destroyCharts(){Object.values(CHARTS).forEach(function(c){try{c.destroy();}catch(e){}});CHARTS={};}
 
 function filterBar(){
   const fb=el('div','filter-bar');
-  [{id:'today',l:'Today'},{id:'week',l:'This week'},{id:'month',l:'This month'},{id:'all',l:'All time'}].forEach(function(f){
-    const p=el('div','fp'+(UI.filter===f.id?' on':''),f.l);
-    p.onclick=function(){UI.filter=f.id;destroyCharts();render();};fb.appendChild(p);
+  [{id:'today',l:'Today'},{id:'week',l:'This week'},{id:'month',l:'This month'},{id:'all',l:'All time'},{id:'custom',l:'Pick dates'}].forEach(function(f){
+    const p=el('button','fp'+(UI.filter===f.id?' on':''),f.l);
+    p.onclick=function(){
+      // First trip into the custom range: seed the last 30 days so the page
+      // has something to show instead of rendering an empty period.
+      if(f.id==='custom'&&!UI.from&&!UI.to){
+        const end=new Date();const start=new Date();start.setDate(start.getDate()-29);
+        UI.from=iso(start);UI.to=iso(end);
+      }
+      UI.filter=f.id;destroyCharts();render();
+    };
+    fb.appendChild(p);
   });
+  if(UI.filter==='custom')fb.appendChild(dateRange());
   return fb;
+}
+function dateRange(){
+  const dr=el('div','date-range');
+  const today=iso(new Date());
+  const from=document.createElement('input');
+  from.type='date';from.className='dr-in';from.value=UI.from||'';
+  from.max=UI.to||today;from.setAttribute('aria-label','Start date');
+  const to=document.createElement('input');
+  to.type='date';to.className='dr-in';to.value=UI.to||'';
+  if(UI.from)to.min=UI.from;
+  to.max=today;to.setAttribute('aria-label','End date');
+  // A range picked backwards is a slip, not a request for zero rows — pull the
+  // other end along instead of showing an empty dashboard.
+  from.onchange=function(){
+    UI.from=from.value;
+    if(UI.from&&UI.to&&UI.from>UI.to)UI.to=UI.from;
+    destroyCharts();render();
+  };
+  to.onchange=function(){
+    UI.to=to.value;
+    if(UI.from&&UI.to&&UI.to<UI.from)UI.from=UI.to;
+    destroyCharts();render();
+  };
+  dr.appendChild(el('span','dr-lbl','From'));
+  dr.appendChild(from);
+  dr.appendChild(el('span','dr-lbl','to'));
+  dr.appendChild(to);
+  const clear=el('button','dr-clear','Clear');
+  clear.onclick=function(){UI.from='';UI.to='';destroyCharts();render();};
+  dr.appendChild(clear);
+  return dr;
 }
 function addBtn(lbl,fn){
   const b=el('button','add-btn',lbl);b.onclick=fn;return b;
@@ -811,7 +898,7 @@ function renderOverview(main,fs,fe,rev,exp,net){
     {l:'Operating expenses',v:'− '+fmt(exp),c:'var(--dt)'},
     {l:'Net profit',v:fmt(netProfit),c:netProfit>=0?'var(--st)':'var(--dt)',bold:true,big:true},
   ];
-  profBar.innerHTML='<div class="card-hd">Profit summary <span>'+UI.filter+'</span></div>';
+  profBar.innerHTML='<div class="card-hd">Profit summary <span>'+filterLabel()+'</span></div>';
   pbRows.forEach(function(row){
     const r=el('div','');
     r.style.cssText='display:flex;justify-content:space-between;padding:'+(row.big?'12px 0 4px':'7px 0')+';border-bottom:1px solid var(--b1);'+(row.big?'border-top:2px solid var(--b2);margin-top:4px':'');
@@ -853,7 +940,7 @@ function renderOverview(main,fs,fe,rev,exp,net){
   }
 
   main.appendChild(profBar);
-  const cc=el('div','card');cc.innerHTML='<div class="card-hd">Revenue by day <span>'+UI.filter+'</span></div>';
+  const cc=el('div','card');cc.innerHTML='<div class="card-hd">Revenue by day <span>'+filterLabel()+'</span></div>';
   const cw=el('div','chart-wrap');const cv=document.createElement('canvas');cv.id='sChart';cw.appendChild(cv);cc.appendChild(cw);main.appendChild(cc);
   const two=el('div','two-col');
   const pm=el('div','card');pm.innerHTML='<div class="card-hd">Payment methods</div>';
@@ -1027,13 +1114,7 @@ function renderEmployees(main,fs){
   const totalHrsToday=todayAtt.reduce(function(a,r){return a+(r.hours_worked||0);},0);
 
   // Period attendance for stats
-  const fAtt=D.attendance.filter(function(a){
-    const d=new Date(a.date);
-    if(UI.filter==='today')return d.toDateString()===now.toDateString();
-    if(UI.filter==='week'){const w=new Date(now);w.setDate(w.getDate()-7);return d>=w;}
-    if(UI.filter==='month'){const m=new Date(now);m.setDate(m.getDate()-30);return d>=m;}
-    return true;
-  });
+  const fAtt=D.attendance.filter(function(a){return inFilter(a.date);});
   const totalHrs=fAtt.reduce(function(a,r){return a+(r.hours_worked||0);},0);
 
   // --- Stats row ---
@@ -1732,14 +1813,7 @@ function renderOrders(main){
 function renderWastage(main,rev){
   main.appendChild(el('div','page-title','Wastage log'));
   main.appendChild(filterBar());
-  const now=new Date();
-  const fw=D.wastage.filter(function(w){
-    const d=new Date(w.date);
-    if(UI.filter==='today')return d.toDateString()===now.toDateString();
-    if(UI.filter==='week'){const wk=new Date(now);wk.setDate(wk.getDate()-7);return d>=wk;}
-    if(UI.filter==='month'){const m=new Date(now);m.setDate(m.getDate()-30);return d>=m;}
-    return true;
-  });
+  const fw=D.wastage.filter(function(w){return inFilter(w.date);});
   const tw=fw.reduce(function(a,w){return a+w.cost;},0);
   const sg=el('div','stats-grid');
   sg.appendChild(statCard('Records',fw.length,'',''));
@@ -1779,7 +1853,7 @@ function renderPnL(main,fs,fe,rev,exp,net){
 
   // Full P&L statement
   const pl=el('div','card');
-  pl.innerHTML='<div class="card-hd">Profit & Loss Statement <span>'+UI.filter+'</span></div>';
+  pl.innerHTML='<div class="card-hd">Profit & Loss Statement <span>'+filterLabel()+'</span></div>';
 
   function plSection(title){
     const h=el('div','');h.style.cssText='font-size:10px;font-weight:800;color:var(--t3);text-transform:uppercase;letter-spacing:1px;padding:14px 0 6px;border-bottom:1px solid var(--b2);margin-top:4px';
@@ -1992,14 +2066,9 @@ function renderModal(root){
   } else if(m.type==='payslip'){
     const e=m.item;
     box.appendChild(el('div','modal-title','Payslip — '+e.name));
-    const now=new Date();
     const eAtt=D.attendance.filter(function(a){
       if(a.employee_id!==e.id||!a.hours_worked)return false;
-      const d=new Date(a.date);
-      if(UI.filter==='today')return d.toDateString()===now.toDateString();
-      if(UI.filter==='week'){const w=new Date(now);w.setDate(w.getDate()-7);return d>=w;}
-      if(UI.filter==='month'){const m2=new Date(now);m2.setDate(m2.getDate()-30);return d>=m2;}
-      return true;
+      return inFilter(a.date);
     });
     const hrs=eAtt.reduce(function(a,r){return a+r.hours_worked;},0);
     const days=new Set(eAtt.map(function(r){return r.date;})).size;
@@ -2008,20 +2077,15 @@ function renderModal(root){
     else if(e.pay_type==='daily')pay=days*e.rate;
     else if(e.pay_type==='monthly')pay=e.rate;
     else{
-      const now2=new Date();
       const er=D.sales.filter(function(s){
         if(!s||s.voided||s.cashier!==e.name)return false;
-        const d=new Date(s.date);
-        if(UI.filter==='today')return d.toDateString()===now2.toDateString();
-        if(UI.filter==='week'){const w=new Date(now2);w.setDate(w.getDate()-7);return d>=w;}
-        if(UI.filter==='month'){const m2=new Date(now2);m2.setDate(m2.getDate()-30);return d>=m2;}
-        return true;
+        return inFilter(s.date);
       }).reduce(function(a,s){return a+s.total;},0);
       pay=er*(e.commission_pct/100);
     }
     const activeLoan=D.loans.filter(function(l){return l.status==='active'&&l.employee_id===e.id;}).reduce(function(a,l){return a+l.balance;},0);
     const deduction=Math.min(activeLoan,pay*0.2);
-    const rows=[['Employee',e.name],['Role',e.role],['Pay type',e.pay_type.toUpperCase()],['Period',UI.filter],['Days worked',days],['Hours worked',hrs.toFixed(1)+'h'],['Rate',e.pay_type==='commission'?e.commission_pct+'%':fmt(e.rate)+'/'+e.pay_type],['Gross pay',fmt(pay)],['Loan deduction',deduction>0?'- '+fmt(deduction):'None'],['NET PAY',fmt(pay-deduction)]];
+    const rows=[['Employee',e.name],['Role',e.role],['Pay type',e.pay_type.toUpperCase()],['Period',filterLabel()],['Days worked',days],['Hours worked',hrs.toFixed(1)+'h'],['Rate',e.pay_type==='commission'?e.commission_pct+'%':fmt(e.rate)+'/'+e.pay_type],['Gross pay',fmt(pay)],['Loan deduction',deduction>0?'- '+fmt(deduction):'None'],['NET PAY',fmt(pay-deduction)]];
     const ps=el('div','',);ps.style.cssText='background:var(--bg2);border-radius:10px;padding:14px';
     rows.forEach(function(row,i){const r=el('div','payslip-row');if(i===rows.length-1)r.style.cssText='font-size:16px;font-weight:800;color:var(--st);border-top:1px solid var(--b2);padding-top:10px';r.innerHTML='<span>'+row[0]+'</span><span>'+row[1]+'</span>';ps.appendChild(r);});
     box.appendChild(ps);
