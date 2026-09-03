@@ -968,8 +968,8 @@ textarea:focus-visible,
 <script>
 const CUR='PHP ',TAX=0.12;
 const CREATOR_PASS='Admin123';
-const CR={name:'Reymar Arroyo',phone:'+639063964052',email:'areymar36@gmail.com',app:'Arroyo POS',ver:'3.1'};
-const GITHUB_PAGES_URL='https://interptools.github.io/arroyo-pos';
+const CR={name:'Reymar Arroyo',phone:'+639063964052',email:'areymar36@gmail.com',app:'Arroyo POS',ver:'3.2'};
+const GITHUB_PAGES_URL='https://donmacchiatos.github.io/DonMac';
 const VERSION_URL=GITHUB_PAGES_URL+'/version.json';
 const UPDATE_URL=GITHUB_PAGES_URL+'/index.html';
 const DASH_UPDATE_URL=GITHUB_PAGES_URL+'/dashboard.html';
@@ -2630,12 +2630,12 @@ function exportCSV(sales){
   const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\r\n');
   const blob=new Blob([csv],{type:'text/csv'});
   const url=URL.createObjectURL(blob);
-  const a=document.createElement('a');a.href=url;a.download='arroyo-pos-'+new Date().toISOString().slice(0,10)+'.csv';a.click();
+  const a=document.createElement('a');a.href=url;a.download='donmac-'+new Date().toISOString().slice(0,10)+'.csv';a.click();
   URL.revokeObjectURL(url);toast('CSV exported!');
 }
 
 function sub(){return S.cart.reduce((s,i)=>s+i.price*i.qty,0);}
-function damt(){const s=sub();return S.discType==='%'?s*Math.min(S.disc,100)/100:Math.min(S.disc,s);}
+function damt(){const s=sub();const d=Math.max(0,S.disc||0);return S.discType==='%'?s*Math.min(d,100)/100:Math.min(d,s);}
 function tamt(){return 0;}
 function tot(){return sub()-damt()+tamt();}
 function txId(){
@@ -3885,6 +3885,7 @@ function renderCart(scr){
   // Live preview box
   const prev=document.createElement('div');prev.className='disc-preview';
   function buildPreview(discVal,discTypeVal){
+    discVal=Math.max(0,discVal||0);
     const s2=sub();
     const da=discTypeVal==='%'?s2*Math.min(discVal,100)/100:Math.min(discVal,s2);
     const total2=s2-da;
@@ -3903,7 +3904,7 @@ function renderCart(scr){
   foot.appendChild(prev);
 
   di.oninput=function(){
-    const v=parseFloat(this.value)||0;S.disc=v;
+    const v=Math.max(0,parseFloat(this.value)||0);S.disc=v;
     buildPreview(v,S.discType);
     dq.querySelectorAll('.disc-qbtn').forEach(b=>{b.className='disc-qbtn'+(b.textContent===v+'%'&&S.discType==='%'?' active':'');});
   };
@@ -7207,7 +7208,7 @@ load();render();
     render();
   }
 })();
-if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('./sw.js').catch(()=>{});});}
+if('serviceWorker' in navigator){window.addEventListener('load',()=>{navigator.serviceWorker.register('./sw.js').then(r=>console.log('[SW] registered, scope:',r.scope)).catch(e=>console.warn('[SW] registration failed:',e));});}
 </script>
 <style>
 #qz-fab{position:fixed;right:14px;bottom:calc(84px + env(safe-area-inset-bottom));z-index:880;
