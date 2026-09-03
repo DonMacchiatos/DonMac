@@ -1,11 +1,11 @@
-/* Arroyo POS — service worker
-   Scope: /arroyo-pos/  (registered from index.html as './sw.js')
+/* Don Mac POS — service worker
+   Scope: /DonMac/  (registered from index.html as './sw.js')
 
    Bump VERSION on every deploy. That name change is what evicts the old
    cache in activate(); leaving it alone means cashiers keep the previous
    shell until the browser happens to discard it on its own. */
-const VERSION = '3.1.0';
-const CACHE = 'arroyo-pos-' + VERSION;
+const VERSION = '3.2.0';
+const CACHE = 'donmac-pos-' + VERSION;
 const NAV_TIMEOUT = 4000;
 
 /* The whole app is inline in index.html — no external CSS, JS, or font
@@ -55,7 +55,7 @@ self.addEventListener('activate', function (e) {
   e.waitUntil((async function () {
     const names = await caches.keys();
     await Promise.all(names.map(function (n) {
-      if (n !== CACHE && n.indexOf('arroyo-pos-') === 0) return caches.delete(n);
+      if (n !== CACHE && n.indexOf('donmac-pos-') === 0) return caches.delete(n);
     }));
     // Take over open tabs. This does NOT reload them — a page mid-sale keeps
     // the JS it already has, and picks up the new build on its next open.
@@ -138,7 +138,7 @@ function offline() {
     'p{font-size:14px;color:#8b8b85;margin:0 0 20px;line-height:1.5}' +
     'button{padding:11px 22px;border:0;border-radius:8px;background:#e8e8e3;color:#111110;' +
     'font-size:14px;font-weight:600;font-family:inherit}</style></head><body><div>' +
-    '<h1>Arroyo POS isn\'t stored on this device yet</h1>' +
+    '<h1>Don Mac POS isn\'t stored on this device yet</h1>' +
     '<p>Open the app once while online and it will work offline after that.</p>' +
     '<button onclick="location.reload()">Try again</button>' +
     '</div></body></html>',
